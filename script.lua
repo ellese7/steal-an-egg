@@ -1,20 +1,20 @@
 -- ==================================================
---  Steal a Pet — AC Research Probe 2 (Delta)
---  WalkSpeed threshold ladder → reaction / remotes / pushback
+--  Steal a Pet — AC Research Probe 2b (Delta)
+--  Stationary WS ladder — any HRP move = real correction
 -- ==================================================
 
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 local LP = Players.LocalPlayer
 
-local MAX_LINES = 200
-local LOG_VIEW = 70
+local MAX_LINES = 180
+local LOG_VIEW = 65
 
 local LADDER = { 50, 100, 150, 200, 250, 300, 400, 500, 750, 1000 }
 local HOLD_SEC = 2.0
 local RESET_SEC = 1.0
 local BASE_WS = 16
-local PUSH_STUD = 2.5 -- soglia spostamento "correzione"
+local MOVE_EPS = 1.0 -- stud: qualunque spostamento >=1 mentre "fermo" = sospetto
 
 local COL = {
 	panel = Color3.fromRGB(13, 15, 20),
@@ -34,18 +34,19 @@ local running = false
 local abortFlag = false
 local lines = {}
 local statusLbl, runBtn, logBox
-local results = {} -- {ws=, line=}
-local remoteHits = {} -- during active step
+local results = {}
+local remoteHits = {}
 local stepActive = false
 local stepWs = 0
 local stepT0 = 0
 local stepOrigin = nil
 local stepMaxDist = 0
-local stepPushAt = nil
+local stepFirstMoveAt = nil
 local stepKick = false
 local stepNotes = {}
 local hooks = {}
-local charConn
+local inputBlocked = false
+local sinkConns = {}
 
 local function findApi(...)
 	local names = { ... }
@@ -136,6 +137,74 @@ local function setWs(v)
 	return false
 end
 
+local function freezeHumanoid(on)
+	local h = getHum()
+	if not h then
+		return
+	end
+	if on then
+		h:ChangeState(Enum.HumanoidStateType.Physics)
+		h.WalkSpeed = 0
+		h.JumpPower = 0
+		pcall(function()
+			h.JumpHeight = 0
+		end)
+		h.AutoRotate = false
+	else
+		h.AutoRotate = true
+		h.WalkSpeed = BASE_WS
+		pcall(function()
+			h.JumpPower = 50
+		end)
+		h:ChangeState(Enum.HumanoidStateType.Running)
+	end
+end
+
+local function anchorHrp(on)
+	local hrp = getHrp()
+	if hrp then
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+		-- NON ancoriamo permanentemente: maschererebbe pushback server.
+		-- Solo azzera velocità; posizione libera per vedere correzioni.
+	end
+end
+
+local function blockMovementInput(on)
+	inputBlocked = on
+	for i = 1, #sinkConns do
+		pcall(function()
+			sinkConns[i]:Disconnect()
+		end)
+	end
+	sinkConns = {}
+	if not on then
+		return
+	end
+	-- sink WASD / stick (best-effort; user must still not touch keys)
+	local keys = {
+		Enum.KeyCode.W,
+		Enum.KeyCode.A,
+		Enum.KeyCode.S,
+		Enum.KeyCode.D,
+		Enum.KeyCode.Up,
+		Enum.KeyCode.Down,
+		Enum.KeyCode.Left,
+		Enum.KeyCode.Right,
+		Enum.KeyCode.Space,
+	}
+	for i = 1, #keys do
+		sinkConns[#sinkConns + 1] = UserInputService.InputBegan:Connect(function(input, gp)
+			if not inputBlocked then
+				return
+			end
+			if input.KeyCode == keys[i] then
+				-- cannot fully eat engine move; warn once
+			end
+		end)
+	end
+end
+
 local function shortArg(a)
 	local t = typeof(a)
 	if t == "Instance" then
@@ -145,16 +214,13 @@ local function shortArg(a)
 		return ok and n or a.ClassName
 	elseif t == "string" then
 		if #a > 48 then
-			return string.format("%q…", string.sub(a, 1, 48))
+			return string.format("%q…", string.sub(a, 1, 40))
 		end
 		return string.format("%q", a)
 	elseif t == "number" then
 		return string.format("%.3g", a)
 	elseif t == "Vector3" then
 		return string.format("(%.1f,%.1f,%.1f)", a.X, a.Y, a.Z)
-	elseif t == "CFrame" then
-		local p = a.Position
-		return string.format("CF(%.1f,%.1f,%.1f)", p.X, p.Y, p.Z)
 	elseif t == "table" then
 		return "table"
 	elseif t == "boolean" then
@@ -187,10 +253,11 @@ local function interestingRemote(path)
 		"pos",
 		"valid",
 		"secure",
-		"moderat",
 		"exploit",
 		"flag",
 		"check",
+		"collision",
+		"push",
 	}
 	for i = 1, #keys do
 		if string.find(low, keys[i], 1, true) then
@@ -213,7 +280,7 @@ local function onRemoteOut(path, method, args)
 	}
 	remoteHits[#remoteHits + 1] = hit
 	if hit.interesting then
-		log(string.format("  REMOTE %.2fs %s:%s %s", hit.t, method, path, hit.args), true)
+		log(string.format("  REMOTE +%.2fs %s %s %s", hit.t, method, path, hit.args), true)
 	end
 end
 
@@ -222,7 +289,7 @@ local function installRemoteHook()
 		return true
 	end
 	if not hookmm or not getnamecall then
-		log("hookmetamethod/getnamecallmethod missing — remotes not hooked", true)
+		log("no hookmm/getnamecall — remotes not hooked", true)
 		return false
 	end
 	local ok, err = pcall(function()
@@ -248,22 +315,20 @@ local function installRemoteHook()
 		log("remote hook FAIL " .. tostring(err), true)
 		return false
 	end
-	log("remote FireServer/InvokeServer hook OK", true)
+	log("remote hook OK", true)
 	return true
 end
 
-local function watchKickSignals()
-	-- Text labels / notifications often appear in PlayerGui
+local function watchKickUi()
 	local pg = LP:FindFirstChild("PlayerGui")
 	if not pg then
-		return
+		return nil
 	end
-	local conn
-	conn = pg.DescendantAdded:Connect(function(d)
+	return pg.DescendantAdded:Connect(function(d)
 		if not stepActive then
 			return
 		end
-		if not d:IsA("TextLabel") and not d:IsA("TextButton") and not d:IsA("TextBox") then
+		if not (d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox")) then
 			return
 		end
 		local t = string.lower(d.Text or "")
@@ -275,15 +340,13 @@ local function watchKickSignals()
 			or string.find(t, "exploit", 1, true)
 			or string.find(t, "cheat", 1, true)
 			or string.find(t, "speed", 1, true)
-			or string.find(t, "teleport", 1, true)
 			or string.find(t, "violat", 1, true)
 		then
 			stepKick = true
-			stepNotes[#stepNotes + 1] = "UI:" .. string.sub(d.Text, 1, 60)
-			log("  UI warn: " .. string.sub(d.Text, 1, 80), true)
+			stepNotes[#stepNotes + 1] = "UI:" .. string.sub(d.Text, 1, 50)
+			log("  UI: " .. string.sub(d.Text, 1, 70), true)
 		end
 	end)
-	return conn
 end
 
 local function beginStep(ws)
@@ -291,15 +354,21 @@ local function beginStep(ws)
 	stepWs = ws
 	stepT0 = os.clock()
 	stepMaxDist = 0
-	stepPushAt = nil
+	stepFirstMoveAt = nil
 	stepKick = false
 	stepNotes = {}
 	remoteHits = {}
 	local hrp = getHrp()
-	stepOrigin = hrp and hrp.Position or nil
+	if hrp then
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+		stepOrigin = hrp.Position
+	else
+		stepOrigin = nil
+	end
 end
 
-local function trackPushback()
+local function samplePos()
 	if not stepActive or not stepOrigin then
 		return
 	end
@@ -307,51 +376,32 @@ local function trackPushback()
 	if not hrp then
 		return
 	end
+	-- kill residual client velocity each frame while testing
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	hrp.AssemblyAngularVelocity = Vector3.zero
 	local d = (hrp.Position - stepOrigin).Magnitude
 	if d > stepMaxDist then
 		stepMaxDist = d
 	end
-	-- pushback = ritorno improvviso verso origin dopo essersi allontanati
-	-- oppure snap indietro: distanza cala di colpo > PUSH_STUD da un picco
-	-- qui loggiamo se durante HOLD la velocità reale è bassa ma WS alto → possibile force
-	-- e se Position viene teletrasportata indietro rispetto al frame precedente
-end
-
-local lastPos = nil
-local function trackSnap()
-	if not stepActive then
-		return
-	end
-	local hrp = getHrp()
-	if not hrp then
-		return
-	end
-	local p = hrp.Position
-	if lastPos then
-		local jump = (p - lastPos).Magnitude
-		-- snap enorme in 1 frame (~teleport correction)
-		if jump >= 8 then
-			local age = os.clock() - stepT0
-			if not stepPushAt then
-				stepPushAt = age
-			end
-			stepNotes[#stepNotes + 1] = string.format("snap=%.1fstud@%.2fs", jump, age)
-			log(string.format("  SNAP %.1f stud at +%.2fs", jump, age), true)
-		end
-	end
-	lastPos = p
-	if stepOrigin then
-		local d = (p - stepOrigin).Magnitude
-		if d > stepMaxDist then
-			stepMaxDist = d
-		end
+	if d >= MOVE_EPS and not stepFirstMoveAt then
+		stepFirstMoveAt = os.clock() - stepT0
+		local delta = hrp.Position - stepOrigin
+		log(
+			string.format(
+				"  MOVE +%.2fs dist=%.2f delta=(%.2f,%.2f,%.2f)",
+				stepFirstMoveAt,
+				d,
+				delta.X,
+				delta.Y,
+				delta.Z
+			),
+			true
+		)
 	end
 end
 
 local function endStep()
 	stepActive = false
-	local parts = {}
-	-- remotes interesting
 	local remLines = {}
 	for i = 1, #remoteHits do
 		local h = remoteHits[i]
@@ -359,41 +409,38 @@ local function endStep()
 			remLines[#remLines + 1] = string.format("%s %s %s", h.method, h.path, h.args)
 		end
 	end
-	-- also keep up to 2 non-interesting if nothing interesting (optional sparse)
-	if #remLines == 0 and #remoteHits > 0 then
-		-- non loggare tutti — solo count
-		parts[#parts + 1] = string.format("%d remotes (none AC-named)", #remoteHits)
-	end
 
 	local line
 	if stepKick then
 		line = string.format("WS=%-4d → KICK/WARN %s", stepWs, table.concat(stepNotes, "; "))
-	elseif stepPushAt or (#stepNotes > 0 and string.find(table.concat(stepNotes), "snap", 1, true)) then
+	elseif stepFirstMoveAt then
 		line = string.format(
-			"WS=%-4d → PUSHBACK/SNAP react=%.2fs maxDist=%.1f %s",
+			"WS=%-4d → POSITION CHANGED +%.2fs maxDist=%.2f stud %s",
 			stepWs,
-			stepPushAt or -1,
+			stepFirstMoveAt,
 			stepMaxDist,
-			table.concat(stepNotes, "; ")
+			#remLines > 0 and ("| REMOTE " .. table.concat(remLines, " || ")) or ""
 		)
 	elseif #remLines > 0 then
 		line = string.format(
-			"WS=%-4d → REMOTE %s | maxDist=%.1f",
+			"WS=%-4d → REMOTE (no move) maxDist=%.2f | %s",
 			stepWs,
-			table.concat(remLines, " || "),
-			stepMaxDist
+			stepMaxDist,
+			table.concat(remLines, " || ")
+		)
+	elseif #remoteHits > 0 then
+		line = string.format(
+			"WS=%-4d → no move (maxDist=%.2f) | %d remotes non-AC",
+			stepWs,
+			stepMaxDist,
+			#remoteHits
 		)
 	else
-		line = string.format("WS=%-4d → no reaction (maxDist=%.1f)", stepWs, stepMaxDist)
-	end
-
-	if #remLines > 0 and not string.find(line, "REMOTE", 1, true) then
-		line = line .. " | REMOTE " .. table.concat(remLines, " || ")
+		line = string.format("WS=%-4d → no reaction (maxDist=%.2f)", stepWs, stepMaxDist)
 	end
 
 	results[#results + 1] = { ws = stepWs, line = line }
 	log(line, true)
-	lastPos = nil
 	stepOrigin = nil
 end
 
@@ -403,14 +450,14 @@ local function waitSec(sec)
 		if abortFlag then
 			return false
 		end
-		trackSnap()
+		samplePos()
 		task.wait()
 	end
 	return true
 end
 
 local function printSummary()
-	log("======== THRESHOLD SUMMARY ========", true)
+	log("======== STATIONARY SUMMARY ========", true)
 	for i = 1, #results do
 		log(results[i].line, true)
 	end
@@ -421,19 +468,35 @@ local function runLadder()
 	results = {}
 	abortFlag = false
 	installRemoteHook()
-	local kickConn = watchKickSignals()
+	local kickConn = watchKickUi()
 
-	local hum = getHum()
-	if not hum then
-		log("NO HUMANOID — spawn first", true)
+	if not getHum() or not getHrp() then
+		log("NO CHARACTER — spawn first", true)
 		setStatus("no character", COL.bad)
 		return
 	end
 
-	log("LADDER start — reset WS=" .. BASE_WS, true)
-	setWs(BASE_WS)
-	if not waitSec(0.5) then
+	log("STATIONARY mode — DO NOT move / jump / shiftlock walk", true)
+	blockMovementInput(true)
+	freezeHumanoid(true)
+	anchorHrp(true)
+	setWs(0)
+	if not waitSec(0.6) then
 		return
+	end
+
+	-- baseline drift check
+	beginStep(0)
+	setWs(0)
+	waitSec(0.5)
+	local baseline = stepMaxDist
+	endStep()
+	if results[#results] then
+		results[#results].line = string.format("BASELINE WS=0 → maxDist=%.2f (expect <1)", baseline)
+		log(results[#results].line, true)
+	end
+	if baseline >= MOVE_EPS then
+		log("WARNING: already drifting while WS=0 — platform/physics noise", true)
 	end
 
 	for i = 1, #LADDER do
@@ -441,15 +504,23 @@ local function runLadder()
 			break
 		end
 		local ws = LADDER[i]
-		setStatus(string.format("testing WS=%d …", ws), COL.accent)
-		log(string.format("--- step WS=%d hold=%.1fs ---", ws, HOLD_SEC))
+		setStatus(string.format("stationary WS=%d …", ws), COL.accent)
+		log(string.format("--- step WS=%d hold=%.1fs (STAND STILL) ---", ws, HOLD_SEC))
 
 		beginStep(ws)
+		-- set WS but keep velocity zeroed every frame in samplePos
 		if not setWs(ws) then
 			log(string.format("WS=%-4d → FAIL no humanoid", ws), true)
-			results[#results + 1] = { ws = ws, line = string.format("WS=%-4d → FAIL no humanoid", ws) }
+			results[#results + 1] = { ws = ws, line = string.format("WS=%-4d → FAIL", ws) }
 			stepActive = false
 			break
+		end
+		local h = getHum()
+		if h then
+			h.JumpPower = 0
+			pcall(function()
+				h.JumpHeight = 0
+			end)
 		end
 
 		if not waitSec(HOLD_SEC) then
@@ -458,14 +529,16 @@ local function runLadder()
 		end
 		endStep()
 
-		-- reset clean
-		setWs(BASE_WS)
-		setStatus(string.format("reset WS=%d", BASE_WS), COL.muted)
+		setWs(0)
+		anchorHrp(true)
+		setStatus("reset WS=0", COL.muted)
 		if not waitSec(RESET_SEC) then
 			break
 		end
 	end
 
+	freezeHumanoid(false)
+	blockMovementInput(false)
 	setWs(BASE_WS)
 	if kickConn then
 		kickConn:Disconnect()
@@ -477,8 +550,10 @@ local function stop()
 	abortFlag = true
 	running = false
 	stepActive = false
-	paintRun()
+	freezeHumanoid(false)
+	blockMovementInput(false)
 	setWs(BASE_WS)
+	paintRun()
 	setStatus("stopped", COL.muted)
 	log("STOP", true)
 end
@@ -491,19 +566,21 @@ local function start()
 	if not LP.Character or not getHum() then
 		log("Wait for character…", true)
 		LP.CharacterAdded:Wait()
-		task.wait(0.3)
+		task.wait(0.4)
 	end
 	running = true
 	paintRun()
-	log("START Probe 2 — do not teleport; walk OK", true)
+	log("START Probe 2b — stand still the whole time", true)
 	task.spawn(function()
 		local ok, err = pcall(runLadder)
 		if not ok then
 			log("CRASH " .. tostring(err), true)
 		end
 		running = false
-		paintRun()
+		freezeHumanoid(false)
+		blockMovementInput(false)
 		setWs(BASE_WS)
+		paintRun()
 		setStatus("done — Copy log", COL.ok)
 	end)
 end
@@ -543,15 +620,15 @@ end
 
 local function buildGui()
 	local pg = LP:FindFirstChild("PlayerGui") or LP:WaitForChild("PlayerGui")
-	local old = pg:FindFirstChild("ACProbe2UI")
+	local old = pg:FindFirstChild("ACProbe2bUI")
 	if old then
 		old:Destroy()
 	end
 
 	local gui = mk("ScreenGui", {
-		Name = "ACProbe2UI",
+		Name = "ACProbe2bUI",
 		ResetOnSpawn = false,
-		DisplayOrder = 121,
+		DisplayOrder = 122,
 		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 	}, pg)
 
@@ -582,7 +659,7 @@ local function buildGui()
 		TextSize = 14,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextColor3 = COL.text,
-		Text = "AC Probe 2 — WS Threshold",
+		Text = "AC Probe 2b — Stationary WS",
 		LayoutOrder = 1,
 	}, root)
 
@@ -604,7 +681,7 @@ local function buildGui()
 		TextSize = 11,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextColor3 = COL.muted,
-		Text = "Delta — open area, then START (~40s)",
+		Text = "STAND STILL — then START (~40s)",
 		LayoutOrder = 3,
 	}, root)
 
@@ -624,11 +701,11 @@ local function buildGui()
 		BorderSizePixel = 0,
 		ScrollBarThickness = 4,
 		ScrollBarImageColor3 = COL.accent,
-		CanvasSize = UDim2.fromOffset(0, 1100),
+		CanvasSize = UDim2.fromOffset(0, 1000),
 	}, shell)
 
 	logBox = mk("TextLabel", {
-		Size = UDim2.new(1, -4, 0, 1100),
+		Size = UDim2.new(1, -4, 0, 1000),
 		Position = UDim2.fromOffset(2, 2),
 		BackgroundTransparency = 1,
 		Text = "",
@@ -685,7 +762,4 @@ local function buildGui()
 end
 
 buildGui()
-log("ready — Probe 2 WS ladder (Delta)", true)
-if not hookmm then
-	log("WARNING: no hookmetamethod — remotes limited", true)
-end
+log("ready — Probe 2b stationary (Delta)", true)
