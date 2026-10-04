@@ -1,20 +1,14 @@
 -- ==================================================
---  Steal a Pet — AC Research Probe 2b (Delta)
---  Stationary WS ladder — any HRP move = real correction
+--  Steal a Pet — AC Research Probe Decompile (Delta)
+--  AntiCollisionHighSeedPushBack / Kernel / ContentCatalog
 -- ==================================================
 
 local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
 local LP = Players.LocalPlayer
 
-local MAX_LINES = 180
-local LOG_VIEW = 65
-
-local LADDER = { 50, 100, 150, 200, 250, 300, 400, 500, 750, 1000 }
-local HOLD_SEC = 2.0
-local RESET_SEC = 1.0
-local BASE_WS = 16
-local MOVE_EPS = 1.0 -- stud: qualunque spostamento >=1 mentre "fermo" = sospetto
+local MAX_LINES = 400
+local LOG_VIEW = 80
+local CHUNK = 900 -- chars per log block
 
 local COL = {
 	panel = Color3.fromRGB(13, 15, 20),
@@ -34,19 +28,13 @@ local running = false
 local abortFlag = false
 local lines = {}
 local statusLbl, runBtn, logBox
-local results = {}
-local remoteHits = {}
-local stepActive = false
-local stepWs = 0
-local stepT0 = 0
-local stepOrigin = nil
-local stepMaxDist = 0
-local stepFirstMoveAt = nil
-local stepKick = false
-local stepNotes = {}
-local hooks = {}
-local inputBlocked = false
-local sinkConns = {}
+
+local TARGETS = {
+	{ name = "AntiCollisionHighSeedPushBack", find = "char" },
+	{ name = "Kernel", find = "playerscripts" },
+	{ name = "ContentCatalog", find = "any" },
+	{ name = "ActiveAssetsController", find = "any" },
+}
 
 local function findApi(...)
 	local names = { ... }
@@ -69,11 +57,9 @@ local function findApi(...)
 end
 
 local setclipFn = findApi("setclipboard", "toclipboard", "setrbxclipboard")
-local hookmm = findApi("hookmetamethod")
-local getnamecall = findApi("getnamecallmethod")
-local newcclosure = findApi("newcclosure") or function(f)
-	return f
-end
+local decompileFn = findApi("decompile")
+local getsbFn = findApi("getscriptbytecode", "dumpstring")
+local getgcFn = findApi("getgc")
 
 local function refreshLogBox()
 	if not logBox then
@@ -118,441 +104,315 @@ local function paintRun()
 	end
 end
 
-local function getHum()
-	local c = LP.Character
-	return c and c:FindFirstChildOfClass("Humanoid")
-end
-
-local function getHrp()
-	local c = LP.Character
-	return c and c:FindFirstChild("HumanoidRootPart")
-end
-
-local function setWs(v)
-	local h = getHum()
-	if h then
-		h.WalkSpeed = v
-		return true
-	end
-	return false
-end
-
-local function freezeHumanoid(on)
-	local h = getHum()
-	if not h then
+local function dumpBlocks(label, text)
+	if typeof(text) ~= "string" or #text == 0 then
+		log(label .. " EMPTY", true)
 		return
 	end
-	if on then
-		h:ChangeState(Enum.HumanoidStateType.Physics)
-		h.WalkSpeed = 0
-		h.JumpPower = 0
-		pcall(function()
-			h.JumpHeight = 0
-		end)
-		h.AutoRotate = false
+	log(string.format("%s len=%d", label, #text), true)
+	local n = math.ceil(#text / CHUNK)
+	-- max 12 blocks per script to avoid spam
+	local maxB = math.min(n, 12)
+	for i = 1, maxB do
+		local a = (i - 1) * CHUNK + 1
+		local b = math.min(#text, i * CHUNK)
+		log(string.format("--- %s [%d/%d] ---", label, i, maxB))
+		log(string.sub(text, a, b))
+		if abortFlag then
+			return
+		end
+		task.wait()
+	end
+	if n > maxB then
+		log(string.format("%s TRUNCATED (+%d blocks not shown)", label, n - maxB), true)
+	end
+end
+
+local function extractHints(src)
+	if typeof(src) ~= "string" then
+		return
+	end
+	local hints = {}
+	-- remotes / strings of interest
+	for w in string.gmatch(src, "[%w_]*[Rr]emote[%w_]*") do
+		hints[w] = true
+	end
+	for w in string.gmatch(src, "FireServer") do
+		hints[w] = true
+	end
+	for w in string.gmatch(src, "InvokeServer") do
+		hints[w] = true
+	end
+	for w in string.gmatch(src, "WalkSpeed") do
+		hints[w] = true
+	end
+	for w in string.gmatch(src, "AssemblyLinearVelocity") do
+		hints[w] = true
+	end
+	for w in string.gmatch(src, "CFrame") do
+		hints[w] = true
+	end
+	for w in string.gmatch(src, "[%w_/]*[Aa]nti[%w_]*") do
+		hints[w] = true
+	end
+	for w in string.gmatch(src, "[%w_]*[Ss]peed[%w_]*") do
+		hints[w] = true
+	end
+	for w in string.gmatch(src, "[%w_]*[Kk]ick[%w_]*") do
+		hints[w] = true
+	end
+	for w in string.gmatch(src, "[%w_]*[Pp]ush[%w_]*") do
+		hints[w] = true
+	end
+	-- quoted strings (short)
+	local nStr = 0
+	for s in string.gmatch(src, '"([^"][%w%s%._%-/][^"]-)"') do
+		if #s >= 3 and #s <= 64 then
+			hints['"' .. s .. '"'] = true
+			nStr += 1
+			if nStr > 25 then
+				break
+			end
+		end
+	end
+	local list = {}
+	for k in pairs(hints) do
+		list[#list + 1] = k
+	end
+	table.sort(list)
+	if #list > 0 then
+		log("HINTS: " .. table.concat(list, ", "), true)
 	else
-		h.AutoRotate = true
-		h.WalkSpeed = BASE_WS
-		pcall(function()
-			h.JumpPower = 50
-		end)
-		h:ChangeState(Enum.HumanoidStateType.Running)
+		log("HINTS: (none extracted)", true)
 	end
 end
 
-local function anchorHrp(on)
-	local hrp = getHrp()
-	if hrp then
-		hrp.AssemblyLinearVelocity = Vector3.zero
-		hrp.AssemblyAngularVelocity = Vector3.zero
-		-- NON ancoriamo permanentemente: maschererebbe pushback server.
-		-- Solo azzera velocità; posizione libera per vedere correzioni.
+local function tryDecompile(inst)
+	if not decompileFn then
+		return nil, "decompile API missing"
 	end
+	local ok, res = pcall(decompileFn, inst)
+	if ok and typeof(res) == "string" and #res > 0 then
+		return res, nil
+	end
+	return nil, tostring(res)
 end
 
-local function blockMovementInput(on)
-	inputBlocked = on
-	for i = 1, #sinkConns do
-		pcall(function()
-			sinkConns[i]:Disconnect()
-		end)
+local function tryBytecode(inst)
+	if not getsbFn then
+		return nil, "getscriptbytecode missing"
 	end
-	sinkConns = {}
-	if not on then
-		return
+	local ok, res = pcall(getsbFn, inst)
+	if ok and typeof(res) == "string" then
+		return res, nil
 	end
-	-- sink WASD / stick (best-effort; user must still not touch keys)
-	local keys = {
-		Enum.KeyCode.W,
-		Enum.KeyCode.A,
-		Enum.KeyCode.S,
-		Enum.KeyCode.D,
-		Enum.KeyCode.Up,
-		Enum.KeyCode.Down,
-		Enum.KeyCode.Left,
-		Enum.KeyCode.Right,
-		Enum.KeyCode.Space,
-	}
-	for i = 1, #keys do
-		sinkConns[#sinkConns + 1] = UserInputService.InputBegan:Connect(function(input, gp)
-			if not inputBlocked then
-				return
-			end
-			if input.KeyCode == keys[i] then
-				-- cannot fully eat engine move; warn once
-			end
-		end)
-	end
+	return nil, tostring(res)
 end
 
-local function shortArg(a)
-	local t = typeof(a)
-	if t == "Instance" then
-		local ok, n = pcall(function()
-			return a:GetFullName()
-		end)
-		return ok and n or a.ClassName
-	elseif t == "string" then
-		if #a > 48 then
-			return string.format("%q…", string.sub(a, 1, 40))
+local function findByName(name, mode)
+	local hits = {}
+	local function consider(inst)
+		if inst.Name ~= name then
+			return
 		end
-		return string.format("%q", a)
-	elseif t == "number" then
-		return string.format("%.3g", a)
-	elseif t == "Vector3" then
-		return string.format("(%.1f,%.1f,%.1f)", a.X, a.Y, a.Z)
-	elseif t == "table" then
-		return "table"
-	elseif t == "boolean" then
-		return tostring(a)
-	end
-	return t
-end
-
-local function fmtArgs(args)
-	local parts = table.create(#args)
-	for i = 1, #args do
-		parts[i] = shortArg(args[i])
-	end
-	return "{" .. table.concat(parts, ", ") .. "}"
-end
-
-local function interestingRemote(path)
-	local low = string.lower(path)
-	local keys = {
-		"speed",
-		"cheat",
-		"anti",
-		"move",
-		"viol",
-		"report",
-		"kick",
-		"ban",
-		"dist",
-		"tele",
-		"pos",
-		"valid",
-		"secure",
-		"exploit",
-		"flag",
-		"check",
-		"collision",
-		"push",
-	}
-	for i = 1, #keys do
-		if string.find(low, keys[i], 1, true) then
-			return true
+		if not (inst:IsA("LocalScript") or inst:IsA("ModuleScript") or inst:IsA("Script")) then
+			-- sometimes the LocalScript is a child with same name, or folder
+			return
 		end
+		hits[#hits + 1] = inst
 	end
-	return false
-end
 
-local function onRemoteOut(path, method, args)
-	if not stepActive then
-		return
-	end
-	local hit = {
-		path = path,
-		method = method,
-		args = fmtArgs(args),
-		t = os.clock() - stepT0,
-		interesting = interestingRemote(path),
-	}
-	remoteHits[#remoteHits + 1] = hit
-	if hit.interesting then
-		log(string.format("  REMOTE +%.2fs %s %s %s", hit.t, method, path, hit.args), true)
-	end
-end
-
-local function installRemoteHook()
-	if #hooks > 0 then
-		return true
-	end
-	if not hookmm or not getnamecall then
-		log("no hookmm/getnamecall — remotes not hooked", true)
-		return false
-	end
-	local ok, err = pcall(function()
-		local old
-		old = hookmm(game, "__namecall", newcclosure(function(self, ...)
-			local method = getnamecall()
-			if stepActive and typeof(self) == "Instance" then
-				if method == "FireServer" or method == "InvokeServer" then
-					if self:IsA("RemoteEvent") or self:IsA("RemoteFunction") or self:IsA("UnreliableRemoteEvent") then
-						local args = { ... }
-						local okp, path = pcall(function()
-							return self:GetFullName()
-						end)
-						onRemoteOut(okp and path or self.Name, method, args)
+	if mode == "char" then
+		local char = LP.Character
+		if char then
+			for _, d in ipairs(char:GetDescendants()) do
+				consider(d)
+				if d.Name == name then
+					-- also collect parent scripts
+					for _, c in ipairs(d:GetDescendants()) do
+						consider(c)
+					end
+					if d:IsA("LocalScript") or d:IsA("ModuleScript") then
+						hits[#hits + 1] = d
 					end
 				end
 			end
-			return old(self, ...)
-		end))
-		hooks[#hooks + 1] = true
-	end)
-	if not ok then
-		log("remote hook FAIL " .. tostring(err), true)
-		return false
-	end
-	log("remote hook OK", true)
-	return true
-end
-
-local function watchKickUi()
-	local pg = LP:FindFirstChild("PlayerGui")
-	if not pg then
-		return nil
-	end
-	return pg.DescendantAdded:Connect(function(d)
-		if not stepActive then
-			return
+			-- name match even if not script class (clone of LocalScript sometimes)
+			local node = char:FindFirstChild(name, true)
+			if node then
+				if node:IsA("LocalScript") or node:IsA("ModuleScript") or node:IsA("Script") then
+					hits[#hits + 1] = node
+				end
+				for _, c in ipairs(node:GetChildren()) do
+					consider(c)
+				end
+				log("FOUND node " .. node:GetFullName() .. " class=" .. node.ClassName, true)
+			end
 		end
-		if not (d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox")) then
-			return
-		end
-		local t = string.lower(d.Text or "")
-		if t == "" then
-			return
-		end
-		if string.find(t, "kick", 1, true)
-			or string.find(t, "ban", 1, true)
-			or string.find(t, "exploit", 1, true)
-			or string.find(t, "cheat", 1, true)
-			or string.find(t, "speed", 1, true)
-			or string.find(t, "violat", 1, true)
-		then
-			stepKick = true
-			stepNotes[#stepNotes + 1] = "UI:" .. string.sub(d.Text, 1, 50)
-			log("  UI: " .. string.sub(d.Text, 1, 70), true)
-		end
-	end)
-end
-
-local function beginStep(ws)
-	stepActive = true
-	stepWs = ws
-	stepT0 = os.clock()
-	stepMaxDist = 0
-	stepFirstMoveAt = nil
-	stepKick = false
-	stepNotes = {}
-	remoteHits = {}
-	local hrp = getHrp()
-	if hrp then
-		hrp.AssemblyLinearVelocity = Vector3.zero
-		hrp.AssemblyAngularVelocity = Vector3.zero
-		stepOrigin = hrp.Position
-	else
-		stepOrigin = nil
-	end
-end
-
-local function samplePos()
-	if not stepActive or not stepOrigin then
-		return
-	end
-	local hrp = getHrp()
-	if not hrp then
-		return
-	end
-	-- kill residual client velocity each frame while testing
-	hrp.AssemblyLinearVelocity = Vector3.zero
-	hrp.AssemblyAngularVelocity = Vector3.zero
-	local d = (hrp.Position - stepOrigin).Magnitude
-	if d > stepMaxDist then
-		stepMaxDist = d
-	end
-	if d >= MOVE_EPS and not stepFirstMoveAt then
-		stepFirstMoveAt = os.clock() - stepT0
-		local delta = hrp.Position - stepOrigin
-		log(
-			string.format(
-				"  MOVE +%.2fs dist=%.2f delta=(%.2f,%.2f,%.2f)",
-				stepFirstMoveAt,
-				d,
-				delta.X,
-				delta.Y,
-				delta.Z
-			),
-			true
-		)
-	end
-end
-
-local function endStep()
-	stepActive = false
-	local remLines = {}
-	for i = 1, #remoteHits do
-		local h = remoteHits[i]
-		if h.interesting then
-			remLines[#remLines + 1] = string.format("%s %s %s", h.method, h.path, h.args)
+	elseif mode == "playerscripts" then
+		local ps = LP:FindFirstChild("PlayerScripts")
+		if ps then
+			local n = ps:FindFirstChild(name, true)
+			if n then
+				log("FOUND " .. n:GetFullName() .. " class=" .. n.ClassName, true)
+				if n:IsA("LocalScript") or n:IsA("ModuleScript") or n:IsA("Script") then
+					hits[#hits + 1] = n
+				end
+				for _, c in ipairs(n:GetDescendants()) do
+					consider(c)
+				end
+			end
 		end
 	end
 
-	local line
-	if stepKick then
-		line = string.format("WS=%-4d → KICK/WARN %s", stepWs, table.concat(stepNotes, "; "))
-	elseif stepFirstMoveAt then
-		line = string.format(
-			"WS=%-4d → POSITION CHANGED +%.2fs maxDist=%.2f stud %s",
-			stepWs,
-			stepFirstMoveAt,
-			stepMaxDist,
-			#remLines > 0 and ("| REMOTE " .. table.concat(remLines, " || ")) or ""
-		)
-	elseif #remLines > 0 then
-		line = string.format(
-			"WS=%-4d → REMOTE (no move) maxDist=%.2f | %s",
-			stepWs,
-			stepMaxDist,
-			table.concat(remLines, " || ")
-		)
-	elseif #remoteHits > 0 then
-		line = string.format(
-			"WS=%-4d → no move (maxDist=%.2f) | %d remotes non-AC",
-			stepWs,
-			stepMaxDist,
-			#remoteHits
-		)
-	else
-		line = string.format("WS=%-4d → no reaction (maxDist=%.2f)", stepWs, stepMaxDist)
-	end
-
-	results[#results + 1] = { ws = stepWs, line = line }
-	log(line, true)
-	stepOrigin = nil
-end
-
-local function waitSec(sec)
-	local t0 = os.clock()
-	while os.clock() - t0 < sec do
-		if abortFlag then
-			return false
-		end
-		samplePos()
-		task.wait()
-	end
-	return true
-end
-
-local function printSummary()
-	log("======== STATIONARY SUMMARY ========", true)
-	for i = 1, #results do
-		log(results[i].line, true)
-	end
-	log("======== END SUMMARY ========", true)
-end
-
-local function runLadder()
-	results = {}
-	abortFlag = false
-	installRemoteHook()
-	local kickConn = watchKickUi()
-
-	if not getHum() or not getHrp() then
-		log("NO CHARACTER — spawn first", true)
-		setStatus("no character", COL.bad)
-		return
-	end
-
-	log("STATIONARY mode — DO NOT move / jump / shiftlock walk", true)
-	blockMovementInput(true)
-	freezeHumanoid(true)
-	anchorHrp(true)
-	setWs(0)
-	if not waitSec(0.6) then
-		return
-	end
-
-	-- baseline drift check
-	beginStep(0)
-	setWs(0)
-	waitSec(0.5)
-	local baseline = stepMaxDist
-	endStep()
-	if results[#results] then
-		results[#results].line = string.format("BASELINE WS=0 → maxDist=%.2f (expect <1)", baseline)
-		log(results[#results].line, true)
-	end
-	if baseline >= MOVE_EPS then
-		log("WARNING: already drifting while WS=0 — platform/physics noise", true)
-	end
-
-	for i = 1, #LADDER do
-		if abortFlag then
-			break
-		end
-		local ws = LADDER[i]
-		setStatus(string.format("stationary WS=%d …", ws), COL.accent)
-		log(string.format("--- step WS=%d hold=%.1fs (STAND STILL) ---", ws, HOLD_SEC))
-
-		beginStep(ws)
-		-- set WS but keep velocity zeroed every frame in samplePos
-		if not setWs(ws) then
-			log(string.format("WS=%-4d → FAIL no humanoid", ws), true)
-			results[#results + 1] = { ws = ws, line = string.format("WS=%-4d → FAIL", ws) }
-			stepActive = false
-			break
-		end
-		local h = getHum()
-		if h then
-			h.JumpPower = 0
-			pcall(function()
-				h.JumpHeight = 0
+	-- global scan fallback
+	local roots = {
+		game:GetService("ReplicatedStorage"),
+		game:GetService("StarterPlayer"),
+		LP:FindFirstChild("PlayerScripts"),
+		LP:FindFirstChild("PlayerGui"),
+		LP.Character,
+	}
+	for _, root in ipairs(roots) do
+		if root then
+			local ok, list = pcall(function()
+				return root:GetDescendants()
 			end)
-		end
-
-		if not waitSec(HOLD_SEC) then
-			endStep()
-			break
-		end
-		endStep()
-
-		setWs(0)
-		anchorHrp(true)
-		setStatus("reset WS=0", COL.muted)
-		if not waitSec(RESET_SEC) then
-			break
+			if ok then
+				for _, d in ipairs(list) do
+					if d.Name == name and (d:IsA("LocalScript") or d:IsA("ModuleScript") or d:IsA("Script")) then
+						hits[#hits + 1] = d
+					end
+				end
+			end
 		end
 	end
 
-	freezeHumanoid(false)
-	blockMovementInput(false)
-	setWs(BASE_WS)
-	if kickConn then
-		kickConn:Disconnect()
+	-- dedupe
+	local seen = {}
+	local uniq = {}
+	for i = 1, #hits do
+		local h = hits[i]
+		if not seen[h] then
+			seen[h] = true
+			uniq[#uniq + 1] = h
+		end
 	end
-	printSummary()
+	return uniq
+end
+
+local function scanGcForName(name)
+	if not getgcFn then
+		return {}
+	end
+	local out = {}
+	local ok, gc = pcall(getgcFn, true)
+	if not ok or typeof(gc) ~= "table" then
+		return out
+	end
+	local n = 0
+	for i = 1, #gc do
+		local v = gc[i]
+		if typeof(v) == "Instance" and (v:IsA("LocalScript") or v:IsA("ModuleScript")) then
+			local okn, nm = pcall(function()
+				return v.Name
+			end)
+			if okn and nm == name then
+				out[#out + 1] = v
+				n += 1
+				if n >= 5 then
+					break
+				end
+			end
+		end
+	end
+	return out
+end
+
+local function processScript(inst)
+	local path = "?"
+	pcall(function()
+		path = inst:GetFullName()
+	end)
+	log("======== TARGET " .. path .. " (" .. inst.ClassName .. ") ========", true)
+
+	-- parent context
+	if inst.Parent then
+		log("parent=" .. inst.Parent:GetFullName() .. " (" .. inst.Parent.ClassName .. ")")
+		for _, sib in ipairs(inst.Parent:GetChildren()) do
+			if sib:IsA("LocalScript") or sib:IsA("ModuleScript") or sib:IsA("Script") then
+				log("  sibling script: " .. sib.Name .. " (" .. sib.ClassName .. ")")
+			end
+		end
+	end
+
+	local src, err = tryDecompile(inst)
+	if src then
+		extractHints(src)
+		dumpBlocks("DECOMPILE " .. inst.Name, src)
+	else
+		log("DECOMPILE FAIL: " .. tostring(err), true)
+		local bc, berr = tryBytecode(inst)
+		if bc then
+			log(string.format("BYTECODE ok len=%d (hex head)", #bc), true)
+			local head = {}
+			for i = 1, math.min(32, #bc) do
+				head[#head + 1] = string.format("%02X", string.byte(bc, i))
+			end
+			log("BC: " .. table.concat(head, " "))
+		else
+			log("BYTECODE FAIL: " .. tostring(berr), true)
+		end
+	end
+end
+
+local function runAll()
+	abortFlag = false
+	if not decompileFn then
+		log("CRITICAL: decompile() not found in Delta env", true)
+		setStatus("no decompile", COL.bad)
+		return
+	end
+	log("decompile=OK getscriptbytecode=" .. tostring(getsbFn ~= nil) .. " getgc=" .. tostring(getgcFn ~= nil), true)
+
+	if not LP.Character then
+		log("waiting Character…", true)
+		LP.CharacterAdded:Wait()
+		task.wait(0.5)
+	end
+
+	for t = 1, #TARGETS do
+		if abortFlag then
+			break
+		end
+		local spec = TARGETS[t]
+		setStatus("decompile " .. spec.name .. "…", COL.accent)
+		log("---- search " .. spec.name .. " ----", true)
+		local hits = findByName(spec.name, spec.find)
+		if #hits == 0 then
+			local gcHits = scanGcForName(spec.name)
+			for i = 1, #gcHits do
+				hits[#hits + 1] = gcHits[i]
+			end
+		end
+		if #hits == 0 then
+			log("NOT FOUND: " .. spec.name, true)
+		else
+			log(string.format("found %d instance(s) for %s", #hits, spec.name), true)
+			for i = 1, math.min(#hits, 3) do
+				processScript(hits[i])
+				task.wait(0.05)
+			end
+		end
+	end
+
+	log("======== DECOMPILE DONE ========", true)
+	log("Paste Copy log here for analysis", true)
 end
 
 local function stop()
 	abortFlag = true
 	running = false
-	stepActive = false
-	freezeHumanoid(false)
-	blockMovementInput(false)
-	setWs(BASE_WS)
 	paintRun()
 	setStatus("stopped", COL.muted)
 	log("STOP", true)
@@ -563,23 +423,15 @@ local function start()
 		stop()
 		return
 	end
-	if not LP.Character or not getHum() then
-		log("Wait for character…", true)
-		LP.CharacterAdded:Wait()
-		task.wait(0.4)
-	end
 	running = true
 	paintRun()
-	log("START Probe 2b — stand still the whole time", true)
+	log("START decompile pass", true)
 	task.spawn(function()
-		local ok, err = pcall(runLadder)
+		local ok, err = pcall(runAll)
 		if not ok then
 			log("CRASH " .. tostring(err), true)
 		end
 		running = false
-		freezeHumanoid(false)
-		blockMovementInput(false)
-		setWs(BASE_WS)
 		paintRun()
 		setStatus("done — Copy log", COL.ok)
 	end)
@@ -620,21 +472,21 @@ end
 
 local function buildGui()
 	local pg = LP:FindFirstChild("PlayerGui") or LP:WaitForChild("PlayerGui")
-	local old = pg:FindFirstChild("ACProbe2bUI")
+	local old = pg:FindFirstChild("ACDecompileUI")
 	if old then
 		old:Destroy()
 	end
 
 	local gui = mk("ScreenGui", {
-		Name = "ACProbe2bUI",
+		Name = "ACDecompileUI",
 		ResetOnSpawn = false,
-		DisplayOrder = 122,
+		DisplayOrder = 123,
 		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 	}, pg)
 
 	local root = mk("Frame", {
-		Size = UDim2.fromOffset(340, 300),
-		Position = UDim2.fromOffset(16, 100),
+		Size = UDim2.fromOffset(360, 320),
+		Position = UDim2.fromOffset(16, 90),
 		BackgroundColor3 = COL.panel,
 		BorderSizePixel = 0,
 		Active = true,
@@ -659,7 +511,7 @@ local function buildGui()
 		TextSize = 14,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextColor3 = COL.text,
-		Text = "AC Probe 2b — Stationary WS",
+		Text = "AC Probe — Decompile",
 		LayoutOrder = 1,
 	}, root)
 
@@ -681,12 +533,12 @@ local function buildGui()
 		TextSize = 11,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextColor3 = COL.muted,
-		Text = "STAND STILL — then START (~40s)",
+		Text = "Delta — spawn in, then START",
 		LayoutOrder = 3,
 	}, root)
 
 	local shell = mk("Frame", {
-		Size = UDim2.new(1, 0, 0, 160),
+		Size = UDim2.new(1, 0, 0, 180),
 		BackgroundColor3 = COL.btn,
 		BorderSizePixel = 0,
 		ClipsDescendants = true,
@@ -701,11 +553,11 @@ local function buildGui()
 		BorderSizePixel = 0,
 		ScrollBarThickness = 4,
 		ScrollBarImageColor3 = COL.accent,
-		CanvasSize = UDim2.fromOffset(0, 1000),
+		CanvasSize = UDim2.fromOffset(0, 2400),
 	}, shell)
 
 	logBox = mk("TextLabel", {
-		Size = UDim2.new(1, -4, 0, 1000),
+		Size = UDim2.new(1, -4, 0, 2400),
 		Position = UDim2.fromOffset(2, 2),
 		BackgroundTransparency = 1,
 		Text = "",
@@ -762,4 +614,8 @@ local function buildGui()
 end
 
 buildGui()
-log("ready — Probe 2b stationary (Delta)", true)
+log("ready — decompile probe (Delta)", true)
+if not decompileFn then
+	log("WARNING: decompile missing", true)
+	setStatus("decompile missing", COL.bad)
+end
