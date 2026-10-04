@@ -7,13 +7,14 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
-local MAX_LINES = 220
-local LOG_VIEW = 75
+local MAX_LINES = 320
+local LOG_VIEW = 90
 
 -- short → mid → long (studs, horizontal only, same Y)
-local LADDER = { 5, 10, 25, 50, 100, 200 }
+local LADDER = { 5, 10, 25, 50, 100, 200, 300, 400, 600, 700 }
 local WATCH_SEC = 2.5
 local RESET_SEC = 1.2
+local LOG_FILE = "sap_ac_probe3_log.txt"
 local SNAP_STUD = 3.0 -- jump in 1 frame = correction
 local BACK_FRAC = 0.35 -- moved back toward origin by this fraction of intended TP
 
@@ -73,7 +74,50 @@ local function findApi(...)
 	end
 end
 
-local setclipFn = findApi("setclipboard", "toclipboard", "setrbxclipboard")
+local function resolveClipboard()
+	local names = { "setclipboard", "toclipboard", "setrbxclipboard", "set_clipboard" }
+	local spots = { _G }
+	pcall(function()
+		if typeof(getgenv) == "function" then
+			spots[#spots + 1] = getgenv()
+		end
+	end)
+	pcall(function()
+		if typeof(getrenv) == "function" then
+			spots[#spots + 1] = getrenv()
+		end
+	end)
+	pcall(function()
+		if typeof(getfenv) == "function" then
+			spots[#spots + 1] = getfenv(0)
+		end
+	end)
+	for s = 1, #spots do
+		for n = 1, #names do
+			local ok, val = pcall(function()
+				return spots[s][names[n]]
+			end)
+			if ok and typeof(val) == "function" then
+				return val, names[n]
+			end
+		end
+	end
+	-- loadstring free-name probe (Delta may inject only as free global)
+	if typeof(loadstring) == "function" then
+		for i = 1, #names do
+			local ok, fn = pcall(function()
+				return loadstring("return " .. names[i])()
+			end)
+			if ok and typeof(fn) == "function" then
+				return fn, names[i]
+			end
+		end
+	end
+	return nil, nil
+end
+
+local setclipFn, setclipName = resolveClipboard()
+local writefileFn = findApi("writefile")
 local hookmm = findApi("hookmetamethod")
 local getnamecall = findApi("getnamecallmethod")
 local newcclosure = findApi("newcclosure") or function(f)
@@ -607,18 +651,38 @@ end
 
 local function copyLog()
 	local text = table.concat(lines, "\n")
+	if text == "" then
+		setStatus("log empty", COL.warn)
+		return
+	end
+	-- refresh TextBox so Ctrl+A / Ctrl+C always works
+	if logBox then
+		logBox.Text = text
+	end
+	-- re-resolve in case API appeared late
+	if not setclipFn then
+		setclipFn, setclipName = resolveClipboard()
+	end
 	if setclipFn then
 		local ok, err = pcall(setclipFn, text)
 		if ok then
-			setStatus("copied " .. #lines, COL.ok)
-			log("COPY ok", true)
-		else
-			setStatus("copy fail", COL.bad)
-			log("COPY err " .. tostring(err), true)
+			setStatus("copied " .. #lines .. " (" .. tostring(setclipName) .. ")", COL.ok)
+			log("COPY ok via " .. tostring(setclipName), true)
+			return
 		end
-	else
-		setStatus("no setclipboard — select text", COL.warn)
+		log("COPY clipboard err " .. tostring(err), true)
 	end
+	if writefileFn then
+		local ok2, err2 = pcall(writefileFn, LOG_FILE, text)
+		if ok2 then
+			setStatus("saved " .. LOG_FILE, COL.ok)
+			log("COPY → writefile " .. LOG_FILE .. " (" .. #lines .. " lines)", true)
+			return
+		end
+		log("COPY writefile err " .. tostring(err2), true)
+	end
+	setStatus("select log TextBox → Ctrl+A Ctrl+C", COL.warn)
+	log("COPY: no clipboard API — select text in box", true)
 end
 
 local function clearLog()
@@ -721,20 +785,25 @@ local function buildGui()
 		BorderSizePixel = 0,
 		ScrollBarThickness = 4,
 		ScrollBarImageColor3 = COL.accent,
-		CanvasSize = UDim2.fromOffset(0, 1200),
+		CanvasSize = UDim2.fromOffset(0, 1800),
 	}, shell)
 
-	logBox = mk("TextLabel", {
-		Size = UDim2.new(1, -4, 0, 1200),
+	-- TextBox: selectable → Ctrl+A / Ctrl+C if clipboard API missing
+	logBox = mk("TextBox", {
+		Size = UDim2.new(1, -4, 0, 1800),
 		Position = UDim2.fromOffset(2, 2),
 		BackgroundTransparency = 1,
 		Text = "",
+		PlaceholderText = "",
 		TextColor3 = Color3.fromRGB(200, 220, 200),
 		TextSize = 11,
 		Font = Enum.Font.Code,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextYAlignment = Enum.TextYAlignment.Top,
 		TextWrapped = true,
+		ClearTextOnFocus = false,
+		MultiLine = true,
+		TextEditable = false,
 	}, scroll)
 
 	local row = mk("Frame", {
@@ -783,6 +852,14 @@ end
 
 buildGui()
 log("ready — Probe 3 teleport ladder (Delta)", true)
+log(
+	"clipboard="
+		.. tostring(setclipName or "none")
+		.. " writefile="
+		.. tostring(writefileFn ~= nil)
+		.. " ladder=5..700",
+	true
+)
 if not hookmm then
 	log("WARNING: no hookmetamethod — remotes limited", true)
 end
