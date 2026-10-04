@@ -84,9 +84,38 @@ end
 --[[
   Clipboard su Delta/LDPlayer:
   setclipboard è spesso un GLOBAL LIBERO dell'executor, NON in _G/getgenv.
-  findApi da solo fallisce → Copy "non fa niente".
-  Pattern provato (egg_pos_map): typeof(setclipboard) + call diretto.
+  Pattern: typeof(setclipboard) + call diretto.
+  Su Android il log GROSSO può "riuscire" senza aggiornare la clipboard
+  (resta il ping di boot). Quindi: verifica con getclipboard, payload compatto.
 ]]
+local CLIP_MARK = "=====SAP_PROBE3_LOG====="
+
+local function pullClipboard()
+	local v = nil
+	pcall(function()
+		if typeof(getclipboard) == "function" then
+			v = getclipboard()
+		end
+	end)
+	if v == nil then
+		pcall(function()
+			if typeof(get_clipboard) == "function" then
+				v = get_clipboard()
+			end
+		end)
+	end
+	if v == nil then
+		local fn = findApi("getclipboard", "get_clipboard")
+		if fn then
+			local ok, r = pcall(fn)
+			if ok then
+				v = r
+			end
+		end
+	end
+	return v
+end
+
 local function pushClipboard(text)
 	local ok, via = false, nil
 	pcall(function()
@@ -122,7 +151,21 @@ local function pushClipboard(text)
 			end
 		end
 	end
-	return ok, via or "none"
+	if not ok then
+		return false, via or "none"
+	end
+	-- verify: se getclipboard esiste, controlla che NON sia ancora il ping e che inizi col marker
+	local got = pullClipboard()
+	if typeof(got) == "string" and #got > 0 then
+		if got == "sap_probe3_clipboard_ping" then
+			return false, "stale_ping"
+		end
+		-- se abbiamo messo il marker, deve esserci
+		if string.find(text, CLIP_MARK, 1, true) and not string.find(got, CLIP_MARK, 1, true) then
+			return false, "verify_miss"
+		end
+	end
+	return true, via or "none"
 end
 
 local function pushFile(path, text)
@@ -149,6 +192,47 @@ local function stashLog(text)
 		end
 		_G.SAP_AC_PROBE3_LOG = text
 	end)
+end
+
+-- Payload clipboard: compatto (Android ha limiti). Full log → writefile.
+local function buildClipPayload()
+	local out = { CLIP_MARK, "lines=" .. tostring(#lines) }
+	for i = 1, #lines do
+		local L = lines[i]
+		-- tieni summary / risultati / errori / remotes (salta rumore frame-by-frame se presente)
+		if string.find(L, ">>>", 1, true)
+			or string.find(L, "TP=", 1, true)
+			or string.find(L, "SUMMARY", 1, true)
+			or string.find(L, "REMOTE", 1, true)
+			or string.find(L, "COPY", 1, true)
+			or string.find(L, "CRASH", 1, true)
+			or string.find(L, "DIED", 1, true)
+			or string.find(L, "---", 1, true)
+			or string.find(L, "warped", 1, true)
+			or string.find(L, "first reaction", 1, true)
+			or string.find(L, "no server", 1, true)
+			or string.find(L, "ready", 1, true)
+			or string.find(L, "LADDER", 1, true)
+			or string.find(L, "START", 1, true)
+			or string.find(L, "SNAP", 1, true)
+			or string.find(L, "PULL", 1, true)
+		then
+			out[#out + 1] = L
+		end
+	end
+	-- se filtrato troppo, manda tutto (ma troncato a 12k char — safe Android)
+	if #out <= 3 then
+		local full = table.concat(lines, "\n")
+		if #full > 12000 then
+			full = string.sub(full, 1, 12000) .. "\n…(truncated)"
+		end
+		return CLIP_MARK .. "\n" .. full
+	end
+	local payload = table.concat(out, "\n")
+	if #payload > 12000 then
+		payload = string.sub(payload, 1, 12000) .. "\n…(truncated)"
+	end
+	return payload
 end
 
 local function refreshLogBox()
@@ -684,30 +768,39 @@ local function start()
 end
 
 copyLog = function()
-	local text = table.concat(lines, "\n")
-	if text == "" then
+	local full = table.concat(lines, "\n")
+	if full == "" then
 		setStatus("log empty", COL.warn)
 		return
 	end
 
-	stashLog(text)
+	local clipText = buildClipPayload()
+	stashLog(full)
+	local okFile = pushFile(LOG_FILE, full)
+	local okClip, via = pushClipboard(clipText)
 
-	local okClip, via = pushClipboard(text)
-	local okFile = pushFile(LOG_FILE, text)
+	if not okClip then
+		local miniParts = { CLIP_MARK, "RETRY", "lines=" .. tostring(#lines) }
+		for i = 1, #results do
+			miniParts[#miniParts + 1] = results[i].line
+		end
+		local mini = table.concat(miniParts, "\n")
+		okClip, via = pushClipboard(mini)
+		clipText = mini
+	end
 
 	if okClip and okFile then
-		setStatus("COPIED " .. #lines .. " + file", COL.ok)
-		log("COPY ok via " .. tostring(via) .. " + writefile " .. LOG_FILE, true)
+		setStatus("COPIED log + file", COL.ok)
+		log("COPY ok via " .. tostring(via) .. " chars=" .. #clipText .. " + " .. LOG_FILE, true)
 	elseif okClip then
-		setStatus("COPIED " .. #lines .. " (" .. tostring(via) .. ")", COL.ok)
-		log("COPY ok via " .. tostring(via), true)
+		setStatus("COPIED log (" .. tostring(via) .. ")", COL.ok)
+		log("COPY ok via " .. tostring(via) .. " chars=" .. #clipText, true)
 	elseif okFile then
-		setStatus("SAVED " .. LOG_FILE .. " (clip fail)", COL.warn)
-		log("COPY clipboard FAIL — writefile OK " .. LOG_FILE, true)
+		setStatus("SAVED file only", COL.warn)
+		log("COPY clip FAIL (" .. tostring(via) .. ") — file OK " .. LOG_FILE, true)
 	else
 		setStatus("COPY FAIL", COL.bad)
-		log("COPY FAIL clip=" .. tostring(via) .. " file=false", true)
-		log("Prova in console Delta: setclipboard(getgenv().SAP_AC_PROBE3_LOG)", true)
+		log("COPY FAIL via=" .. tostring(via), true)
 	end
 end
 
@@ -876,12 +969,22 @@ end
 
 buildGui()
 
--- boot ping: verifica REALE clipboard subito
+-- boot: NON lasciare ping in clipboard. Solo detect API.
 do
-	local ok, via = pushClipboard("sap_probe3_clipboard_ping")
-	if ok then
-		log("ready — Probe 3 | clipboard=" .. tostring(via) .. " OK", true)
-		setStatus("clipboard " .. tostring(via) .. " OK", COL.ok)
+	local hasClip = false
+	pcall(function()
+		hasClip = typeof(setclipboard) == "function"
+			or typeof(toclipboard) == "function"
+			or typeof(setrbxclipboard) == "function"
+	end)
+	if not hasClip then
+		hasClip = findApi("setclipboard", "toclipboard", "setrbxclipboard") ~= nil
+	end
+	if hasClip then
+		-- sovrascrive eventuale ping vecchio con messaggio utile
+		pushClipboard(CLIP_MARK .. "\nREADY — premi START, poi Copy log")
+		log("ready — Probe 3 | clipboard API OK", true)
+		setStatus("clipboard OK — START poi Copy", COL.ok)
 	else
 		local okF = pushFile(LOG_FILE, "ping")
 		log("ready — Probe 3 | clipboard=MISSING writefile=" .. tostring(okF), true)
