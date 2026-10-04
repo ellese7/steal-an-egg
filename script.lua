@@ -74,15 +74,82 @@ local function findApi(...)
 	end
 end
 
--- Same discovery as probe1/2 (proven on Delta). Do NOT use getrenv/loadstring here.
-local setclipFn = findApi("setclipboard", "toclipboard", "setrbxclipboard")
-local writefileFn = findApi("writefile")
+-- Same discovery as probe1/2 for hooks.
 local hookmm = findApi("hookmetamethod")
 local getnamecall = findApi("getnamecallmethod")
 local newcclosure = findApi("newcclosure") or function(f)
 	return f
 end
-local rconsoleprintFn = findApi("rconsoleprint", "consoleprint", "printconsole")
+
+--[[
+  Clipboard su Delta/LDPlayer:
+  setclipboard è spesso un GLOBAL LIBERO dell'executor, NON in _G/getgenv.
+  findApi da solo fallisce → Copy "non fa niente".
+  Pattern provato (egg_pos_map): typeof(setclipboard) + call diretto.
+]]
+local function pushClipboard(text)
+	local ok, via = false, nil
+	pcall(function()
+		if typeof(setclipboard) == "function" then
+			setclipboard(text)
+			ok, via = true, "setclipboard"
+		end
+	end)
+	if not ok then
+		pcall(function()
+			if typeof(toclipboard) == "function" then
+				toclipboard(text)
+				ok, via = true, "toclipboard"
+			end
+		end)
+	end
+	if not ok then
+		pcall(function()
+			if typeof(setrbxclipboard) == "function" then
+				setrbxclipboard(text)
+				ok, via = true, "setrbxclipboard"
+			end
+		end)
+	end
+	if not ok then
+		local fn = findApi("setclipboard", "toclipboard", "setrbxclipboard")
+		if fn then
+			local ok2, err = pcall(fn, text)
+			if ok2 then
+				ok, via = true, "findApi"
+			else
+				return false, "findApi:" .. tostring(err)
+			end
+		end
+	end
+	return ok, via or "none"
+end
+
+local function pushFile(path, text)
+	local ok = false
+	pcall(function()
+		if typeof(writefile) == "function" then
+			writefile(path, text)
+			ok = true
+		end
+	end)
+	if not ok then
+		local fn = findApi("writefile")
+		if fn then
+			ok = pcall(fn, path, text)
+		end
+	end
+	return ok
+end
+
+local function stashLog(text)
+	pcall(function()
+		if typeof(getgenv) == "function" then
+			getgenv().SAP_AC_PROBE3_LOG = text
+		end
+		_G.SAP_AC_PROBE3_LOG = text
+	end)
+end
 
 local function refreshLogBox()
 	if not logBox then
@@ -382,7 +449,10 @@ local function trackCorrection()
 			local towardOrig = (lastPos - stepOrigin).Magnitude - (p - stepOrigin).Magnitude
 			local tag = towardOrig > 1 and "SNAPBACK" or "SNAP"
 			stepNotes[#stepNotes + 1] = string.format("%s=%.1f@%.2fs", tag, jump, age)
-			log(string.format("  %s %.1f stud at +%.2fs (dOrig=%.1f dTgt=%.1f)", tag, jump, age, dOrig, dTgt), true)
+			-- log only first snap per step (avoid clipboard-killing spam on LDPlayer)
+			if #stepNotes <= 1 then
+				log(string.format("  %s %.1f stud at +%.2fs (dOrig=%.1f dTgt=%.1f)", tag, jump, age, dOrig, dTgt), true)
+			end
 		end
 	end
 
@@ -585,6 +655,9 @@ local function stop()
 	log("STOP", true)
 end
 
+-- forward decl: start() chiama copyLog a fine run
+local copyLog
+
 local function start()
 	if running then
 		stop()
@@ -605,74 +678,36 @@ local function start()
 		end
 		running = false
 		paintRun()
-		setStatus("done — Copy log", COL.ok)
+		log("auto-copy…", true)
+		copyLog()
 	end)
 end
 
-local function copyLog()
-	-- Re-resolve at click time (same as working probes: _G + getgenv only)
-	if not setclipFn then
-		setclipFn = findApi("setclipboard", "toclipboard", "setrbxclipboard")
-	end
-	if not writefileFn then
-		writefileFn = findApi("writefile")
-	end
-
+copyLog = function()
 	local text = table.concat(lines, "\n")
 	if text == "" then
 		setStatus("log empty", COL.warn)
 		return
 	end
 
-	-- stash for one-liner in Delta console if needed:
-	-- setclipboard(getgenv().SAP_AC_PROBE3_LOG)
-	pcall(function()
-		if typeof(getgenv) == "function" then
-			getgenv().SAP_AC_PROBE3_LOG = text
-		end
-		_G.SAP_AC_PROBE3_LOG = text
-	end)
+	stashLog(text)
 
-	local okClip, errClip = false, "no api"
-	if setclipFn then
-		okClip, errClip = pcall(setclipFn, text)
-	end
-
-	local okFile, errFile = false, "no api"
-	if writefileFn then
-		okFile, errFile = pcall(writefileFn, LOG_FILE, text)
-	end
-
-	-- Delta console dump (copyable inside executor on Android)
-	pcall(function()
-		if rconsoleprintFn then
-			rconsoleprintFn("\n===== SAP PROBE3 LOG BEGIN =====\n")
-			rconsoleprintFn(text)
-			rconsoleprintFn("\n===== SAP PROBE3 LOG END =====\n")
-		else
-			print("===== SAP PROBE3 LOG BEGIN =====")
-			-- chunk prints (Android print buffer limits)
-			local chunk = 800
-			for i = 1, #text, chunk do
-				print(string.sub(text, i, math.min(i + chunk - 1, #text)))
-			end
-			print("===== SAP PROBE3 LOG END =====")
-		end
-	end)
+	local okClip, via = pushClipboard(text)
+	local okFile = pushFile(LOG_FILE, text)
 
 	if okClip and okFile then
-		setStatus("copied + file " .. LOG_FILE, COL.ok)
-		log("COPY ok (clipboard + " .. LOG_FILE .. ") lines=" .. #lines, true)
+		setStatus("COPIED " .. #lines .. " + file", COL.ok)
+		log("COPY ok via " .. tostring(via) .. " + writefile " .. LOG_FILE, true)
 	elseif okClip then
-		setStatus("copied " .. #lines .. " (clipboard)", COL.ok)
-		log("COPY ok clipboard lines=" .. #lines, true)
+		setStatus("COPIED " .. #lines .. " (" .. tostring(via) .. ")", COL.ok)
+		log("COPY ok via " .. tostring(via), true)
 	elseif okFile then
-		setStatus("saved " .. LOG_FILE .. " (no clipboard)", COL.ok)
-		log("COPY ok writefile " .. LOG_FILE .. " lines=" .. #lines, true)
+		setStatus("SAVED " .. LOG_FILE .. " (clip fail)", COL.warn)
+		log("COPY clipboard FAIL — writefile OK " .. LOG_FILE, true)
 	else
-		setStatus("COPY FAIL — see status", COL.bad)
-		log("COPY FAIL clip=" .. tostring(errClip) .. " file=" .. tostring(errFile), true)
-		log("fallback: getgenv().SAP_AC_PROBE3_LOG  OR  Delta console", true)
+		setStatus("COPY FAIL", COL.bad)
+		log("COPY FAIL clip=" .. tostring(via) .. " file=false", true)
+		log("Prova in console Delta: setclipboard(getgenv().SAP_AC_PROBE3_LOG)", true)
 	end
 end
 
@@ -700,16 +735,17 @@ local function buildGui()
 		old:Destroy()
 	end
 
+	-- Layout IDENTICO a probe_constants_dump (Copy funzionante li)
 	local gui = mk("ScreenGui", {
 		Name = "ACProbe3UI",
 		ResetOnSpawn = false,
-		DisplayOrder = 122,
+		DisplayOrder = 124,
 		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 	}, pg)
 
 	local root = mk("Frame", {
-		Size = UDim2.fromOffset(340, 300),
-		Position = UDim2.fromOffset(16, 100),
+		Size = UDim2.fromOffset(360, 320),
+		Position = UDim2.fromOffset(16, 90),
 		BackgroundColor3 = COL.panel,
 		BorderSizePixel = 0,
 		Active = true,
@@ -761,7 +797,7 @@ local function buildGui()
 	}, root)
 
 	local shell = mk("Frame", {
-		Size = UDim2.new(1, 0, 0, 160),
+		Size = UDim2.new(1, 0, 0, 180),
 		BackgroundColor3 = COL.btn,
 		BorderSizePixel = 0,
 		ClipsDescendants = true,
@@ -776,11 +812,11 @@ local function buildGui()
 		BorderSizePixel = 0,
 		ScrollBarThickness = 4,
 		ScrollBarImageColor3 = COL.accent,
-		CanvasSize = UDim2.fromOffset(0, 1200),
+		CanvasSize = UDim2.fromOffset(0, 2200),
 	}, shell)
 
 	logBox = mk("TextLabel", {
-		Size = UDim2.new(1, -4, 0, 1200),
+		Size = UDim2.new(1, -4, 0, 2200),
 		Position = UDim2.fromOffset(2, 2),
 		BackgroundTransparency = 1,
 		Text = "",
@@ -809,6 +845,7 @@ local function buildGui()
 		TextSize = 12,
 		TextColor3 = COL.text,
 		BackgroundColor3 = COL.copy,
+		AutoButtonColor = true,
 		Text = "Copy log",
 	}, row)
 	mk("UICorner", { CornerRadius = UDim.new(0, 8) }, copyBtn)
@@ -820,32 +857,37 @@ local function buildGui()
 		TextSize = 12,
 		TextColor3 = COL.text,
 		BackgroundColor3 = COL.clear,
+		AutoButtonColor = true,
 		Text = "Clear",
 	}, row)
 	mk("UICorner", { CornerRadius = UDim.new(0, 8) }, clearBtn)
 
 	paintRun()
-	runBtn.Activated:Connect(function()
+	runBtn.MouseButton1Click:Connect(function()
 		if running then
 			stop()
 		else
 			start()
 		end
 	end)
-	copyBtn.Activated:Connect(copyLog)
-	clearBtn.Activated:Connect(clearLog)
+	copyBtn.MouseButton1Click:Connect(copyLog)
+	clearBtn.MouseButton1Click:Connect(clearLog)
 end
 
 buildGui()
-log("ready — Probe 3 teleport ladder (Delta/LDPlayer)", true)
-log(
-	"copy apis: clip="
-		.. tostring(setclipFn ~= nil)
-		.. " writefile="
-		.. tostring(writefileFn ~= nil)
-		.. " ladder=5..700",
-	true
-)
+
+-- boot ping: verifica REALE clipboard subito
+do
+	local ok, via = pushClipboard("sap_probe3_clipboard_ping")
+	if ok then
+		log("ready — Probe 3 | clipboard=" .. tostring(via) .. " OK", true)
+		setStatus("clipboard " .. tostring(via) .. " OK", COL.ok)
+	else
+		local okF = pushFile(LOG_FILE, "ping")
+		log("ready — Probe 3 | clipboard=MISSING writefile=" .. tostring(okF), true)
+		setStatus(okF and "no clip — usera file" or "COPY API MISSING", okF and COL.warn or COL.bad)
+	end
+end
 if not hookmm then
 	log("WARNING: no hookmetamethod — remotes limited", true)
 end
