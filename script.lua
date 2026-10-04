@@ -14,9 +14,9 @@ local LOG_VIEW = 90
 local LADDER = { 5, 10, 25, 50, 100, 200, 300, 400, 600, 700 }
 local WATCH_SEC = 2.5
 local RESET_SEC = 1.2
-local LOG_FILE = "sap_ac_probe3_log.txt"
 local SNAP_STUD = 3.0 -- jump in 1 frame = correction
 local BACK_FRAC = 0.35 -- moved back toward origin by this fraction of intended TP
+local LOG_FILE = "sap_ac_probe3_log.txt"
 
 local COL = {
 	panel = Color3.fromRGB(13, 15, 20),
@@ -74,55 +74,15 @@ local function findApi(...)
 	end
 end
 
-local function resolveClipboard()
-	local names = { "setclipboard", "toclipboard", "setrbxclipboard", "set_clipboard" }
-	local spots = { _G }
-	pcall(function()
-		if typeof(getgenv) == "function" then
-			spots[#spots + 1] = getgenv()
-		end
-	end)
-	pcall(function()
-		if typeof(getrenv) == "function" then
-			spots[#spots + 1] = getrenv()
-		end
-	end)
-	pcall(function()
-		if typeof(getfenv) == "function" then
-			spots[#spots + 1] = getfenv(0)
-		end
-	end)
-	for s = 1, #spots do
-		for n = 1, #names do
-			local ok, val = pcall(function()
-				return spots[s][names[n]]
-			end)
-			if ok and typeof(val) == "function" then
-				return val, names[n]
-			end
-		end
-	end
-	-- loadstring free-name probe (Delta may inject only as free global)
-	if typeof(loadstring) == "function" then
-		for i = 1, #names do
-			local ok, fn = pcall(function()
-				return loadstring("return " .. names[i])()
-			end)
-			if ok and typeof(fn) == "function" then
-				return fn, names[i]
-			end
-		end
-	end
-	return nil, nil
-end
-
-local setclipFn, setclipName = resolveClipboard()
+-- Same discovery as probe1/2 (proven on Delta). Do NOT use getrenv/loadstring here.
+local setclipFn = findApi("setclipboard", "toclipboard", "setrbxclipboard")
 local writefileFn = findApi("writefile")
 local hookmm = findApi("hookmetamethod")
 local getnamecall = findApi("getnamecallmethod")
 local newcclosure = findApi("newcclosure") or function(f)
 	return f
 end
+local rconsoleprintFn = findApi("rconsoleprint", "consoleprint", "printconsole")
 
 local function refreshLogBox()
 	if not logBox then
@@ -650,39 +610,70 @@ local function start()
 end
 
 local function copyLog()
+	-- Re-resolve at click time (same as working probes: _G + getgenv only)
+	if not setclipFn then
+		setclipFn = findApi("setclipboard", "toclipboard", "setrbxclipboard")
+	end
+	if not writefileFn then
+		writefileFn = findApi("writefile")
+	end
+
 	local text = table.concat(lines, "\n")
 	if text == "" then
 		setStatus("log empty", COL.warn)
 		return
 	end
-	-- refresh TextBox so Ctrl+A / Ctrl+C always works
-	if logBox then
-		logBox.Text = text
-	end
-	-- re-resolve in case API appeared late
-	if not setclipFn then
-		setclipFn, setclipName = resolveClipboard()
-	end
+
+	-- stash for one-liner in Delta console if needed:
+	-- setclipboard(getgenv().SAP_AC_PROBE3_LOG)
+	pcall(function()
+		if typeof(getgenv) == "function" then
+			getgenv().SAP_AC_PROBE3_LOG = text
+		end
+		_G.SAP_AC_PROBE3_LOG = text
+	end)
+
+	local okClip, errClip = false, "no api"
 	if setclipFn then
-		local ok, err = pcall(setclipFn, text)
-		if ok then
-			setStatus("copied " .. #lines .. " (" .. tostring(setclipName) .. ")", COL.ok)
-			log("COPY ok via " .. tostring(setclipName), true)
-			return
-		end
-		log("COPY clipboard err " .. tostring(err), true)
+		okClip, errClip = pcall(setclipFn, text)
 	end
+
+	local okFile, errFile = false, "no api"
 	if writefileFn then
-		local ok2, err2 = pcall(writefileFn, LOG_FILE, text)
-		if ok2 then
-			setStatus("saved " .. LOG_FILE, COL.ok)
-			log("COPY → writefile " .. LOG_FILE .. " (" .. #lines .. " lines)", true)
-			return
-		end
-		log("COPY writefile err " .. tostring(err2), true)
+		okFile, errFile = pcall(writefileFn, LOG_FILE, text)
 	end
-	setStatus("select log TextBox → Ctrl+A Ctrl+C", COL.warn)
-	log("COPY: no clipboard API — select text in box", true)
+
+	-- Delta console dump (copyable inside executor on Android)
+	pcall(function()
+		if rconsoleprintFn then
+			rconsoleprintFn("\n===== SAP PROBE3 LOG BEGIN =====\n")
+			rconsoleprintFn(text)
+			rconsoleprintFn("\n===== SAP PROBE3 LOG END =====\n")
+		else
+			print("===== SAP PROBE3 LOG BEGIN =====")
+			-- chunk prints (Android print buffer limits)
+			local chunk = 800
+			for i = 1, #text, chunk do
+				print(string.sub(text, i, math.min(i + chunk - 1, #text)))
+			end
+			print("===== SAP PROBE3 LOG END =====")
+		end
+	end)
+
+	if okClip and okFile then
+		setStatus("copied + file " .. LOG_FILE, COL.ok)
+		log("COPY ok (clipboard + " .. LOG_FILE .. ") lines=" .. #lines, true)
+	elseif okClip then
+		setStatus("copied " .. #lines .. " (clipboard)", COL.ok)
+		log("COPY ok clipboard lines=" .. #lines, true)
+	elseif okFile then
+		setStatus("saved " .. LOG_FILE .. " (no clipboard)", COL.ok)
+		log("COPY ok writefile " .. LOG_FILE .. " lines=" .. #lines, true)
+	else
+		setStatus("COPY FAIL — see status", COL.bad)
+		log("COPY FAIL clip=" .. tostring(errClip) .. " file=" .. tostring(errFile), true)
+		log("fallback: getgenv().SAP_AC_PROBE3_LOG  OR  Delta console", true)
+	end
 end
 
 local function clearLog()
@@ -785,25 +776,20 @@ local function buildGui()
 		BorderSizePixel = 0,
 		ScrollBarThickness = 4,
 		ScrollBarImageColor3 = COL.accent,
-		CanvasSize = UDim2.fromOffset(0, 1800),
+		CanvasSize = UDim2.fromOffset(0, 1200),
 	}, shell)
 
-	-- TextBox: selectable → Ctrl+A / Ctrl+C if clipboard API missing
-	logBox = mk("TextBox", {
-		Size = UDim2.new(1, -4, 0, 1800),
+	logBox = mk("TextLabel", {
+		Size = UDim2.new(1, -4, 0, 1200),
 		Position = UDim2.fromOffset(2, 2),
 		BackgroundTransparency = 1,
 		Text = "",
-		PlaceholderText = "",
 		TextColor3 = Color3.fromRGB(200, 220, 200),
 		TextSize = 11,
 		Font = Enum.Font.Code,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextYAlignment = Enum.TextYAlignment.Top,
 		TextWrapped = true,
-		ClearTextOnFocus = false,
-		MultiLine = true,
-		TextEditable = false,
 	}, scroll)
 
 	local row = mk("Frame", {
@@ -839,22 +825,22 @@ local function buildGui()
 	mk("UICorner", { CornerRadius = UDim.new(0, 8) }, clearBtn)
 
 	paintRun()
-	runBtn.MouseButton1Click:Connect(function()
+	runBtn.Activated:Connect(function()
 		if running then
 			stop()
 		else
 			start()
 		end
 	end)
-	copyBtn.MouseButton1Click:Connect(copyLog)
-	clearBtn.MouseButton1Click:Connect(clearLog)
+	copyBtn.Activated:Connect(copyLog)
+	clearBtn.Activated:Connect(clearLog)
 end
 
 buildGui()
-log("ready — Probe 3 teleport ladder (Delta)", true)
+log("ready — Probe 3 teleport ladder (Delta/LDPlayer)", true)
 log(
-	"clipboard="
-		.. tostring(setclipName or "none")
+	"copy apis: clip="
+		.. tostring(setclipFn ~= nil)
 		.. " writefile="
 		.. tostring(writefileFn ~= nil)
 		.. " ladder=5..700",
