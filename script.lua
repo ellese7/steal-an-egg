@@ -1,16 +1,21 @@
 -- ==================================================
---  Steal a Pet — AC Research Probe Constants/Connections (Delta)
---  AntiCollisionHighSeedPushBack / FixCollisions / Kernel
+--  Steal a Pet — AC Research Probe 3 (Delta)
+--  Teleport distance ladder → snapback / remotes / delay
 -- ==================================================
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
-local MAX_LINES = 350
-local LOG_VIEW = 90
-local MAX_PROTO_DEPTH = 2
-local MAX_CONST_SHOW = 80
-local MAX_PROTOS = 40
+local MAX_LINES = 220
+local LOG_VIEW = 75
+
+-- short → mid → long (studs, horizontal only, same Y)
+local LADDER = { 5, 10, 25, 50, 100, 200 }
+local WATCH_SEC = 2.5
+local RESET_SEC = 1.2
+local SNAP_STUD = 3.0 -- jump in 1 frame = correction
+local BACK_FRAC = 0.35 -- moved back toward origin by this fraction of intended TP
 
 local COL = {
 	panel = Color3.fromRGB(13, 15, 20),
@@ -26,17 +31,27 @@ local COL = {
 	bad = Color3.fromRGB(220, 80, 80),
 }
 
-local TARGETS = {
-	{ name = "AntiCollisionHighSeedPushBack", where = "char" },
-	{ name = "FixCollisions", where = "char" },
-	{ name = "Kernel", where = "ps" },
-}
-
 local running = false
 local abortFlag = false
 local lines = {}
 local statusLbl, runBtn, logBox
-local apiWarn = {}
+local results = {}
+local remoteHits = {}
+local stepActive = false
+local stepDist = 0
+local stepT0 = 0
+local stepOrigin = nil
+local stepTarget = nil
+local stepReactAt = nil
+local stepMaxSnap = 0
+local stepClosestToOrigin = nil -- min dist to origin after TP
+local stepFarthestFromOrigin = 0
+local stepDied = false
+local stepKick = false
+local stepNotes = {}
+local hooks = {}
+local lastPos = nil
+local diedConn = nil
 
 local function findApi(...)
 	local names = { ... }
@@ -59,28 +74,11 @@ local function findApi(...)
 end
 
 local setclipFn = findApi("setclipboard", "toclipboard", "setrbxclipboard")
-local getsbFn = findApi("getscriptbytecode", "dumpstring")
-local getconstantsFn = findApi("getconstants", "debug.getconstants")
-local getprotosFn = findApi("getprotos", "debug.getprotos")
-local getupvaluesFn = findApi("getupvalues", "debug.getupvalues")
-local getinfoFn = findApi("getinfo", "debug.getinfo", "debug.info")
-local getconnectionsFn = findApi("getconnections")
-local getgcFn = findApi("getgc")
-local islclosureFn = findApi("islclosure")
-local iscclosureFn = findApi("iscclosure")
-
--- debug library fallbacks
-pcall(function()
-	if not getconstantsFn and debug and debug.getconstants then
-		getconstantsFn = debug.getconstants
-	end
-	if not getprotosFn and debug and debug.getprotos then
-		getprotosFn = debug.getprotos
-	end
-	if not getupvaluesFn and debug and debug.getupvalues then
-		getupvaluesFn = debug.getupvalues
-	end
-end)
+local hookmm = findApi("hookmetamethod")
+local getnamecall = findApi("getnamecallmethod")
+local newcclosure = findApi("newcclosure") or function(f)
+	return f
+end
 
 local function refreshLogBox()
 	if not logBox then
@@ -125,404 +123,459 @@ local function paintRun()
 	end
 end
 
-local function warnOnce(key, msg)
-	if apiWarn[key] then
-		return
-	end
-	apiWarn[key] = true
-	log("API " .. msg, true)
+local function getHum()
+	local c = LP.Character
+	return c and c:FindFirstChildOfClass("Humanoid")
 end
 
-local function keepConst(v)
-	local t = typeof(v)
-	if t == "string" then
-		if #v < 3 then
-			return false
-		end
-		local skip = {
-			["true"] = true,
-			["false"] = true,
-			["nil"] = true,
-			["and"] = true,
-			["or"] = true,
-		}
-		if skip[v] then
-			return false
-		end
-		return true
-	elseif t == "number" then
-		if v == 0 or v == 1 or v == -1 then
-			return false
-		end
-		return true
-	elseif t == "boolean" then
-		return false
-	elseif t == "vector" or t == "Vector3" then
-		return true
-	end
-	return t ~= "nil"
+local function getHrp()
+	local c = LP.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
 end
 
-local function fmtConst(v)
-	local t = typeof(v)
-	if t == "string" then
-		local s = v
-		if #s > 60 then
-			s = string.sub(s, 1, 57) .. "…"
-		end
-		return string.format("%q", s)
-	elseif t == "number" then
-		return string.format("%.6g", v)
-	elseif t == "Instance" then
+local function shortArg(a)
+	local t = typeof(a)
+	if t == "Instance" then
 		local ok, n = pcall(function()
-			return v:GetFullName()
+			return a:GetFullName()
 		end)
-		return "Instance:" .. (ok and n or v.ClassName)
-	elseif t == "function" then
-		return "function"
+		return ok and n or a.ClassName
+	elseif t == "string" then
+		if #a > 48 then
+			return string.format("%q…", string.sub(a, 1, 48))
+		end
+		return string.format("%q", a)
+	elseif t == "number" then
+		return string.format("%.3g", a)
+	elseif t == "Vector3" then
+		return string.format("(%.1f,%.1f,%.1f)", a.X, a.Y, a.Z)
+	elseif t == "CFrame" then
+		local p = a.Position
+		return string.format("CF(%.1f,%.1f,%.1f)", p.X, p.Y, p.Z)
 	elseif t == "table" then
 		return "table"
-	elseif t == "Vector3" then
-		return string.format("V3(%.1f,%.1f,%.1f)", v.X, v.Y, v.Z)
+	elseif t == "boolean" then
+		return tostring(a)
 	end
-	return t .. ":" .. tostring(v)
+	return t
 end
 
-local function collectConstants(fn)
-	if not getconstantsFn then
-		warnOnce("getconstants", "getconstants missing — skip")
-		return {}
+local function fmtArgs(args)
+	local parts = table.create(#args)
+	for i = 1, #args do
+		parts[i] = shortArg(args[i])
 	end
-	local ok, consts = pcall(getconstantsFn, fn)
-	if not ok or typeof(consts) ~= "table" then
-		return { "__err:" .. tostring(consts) }
-	end
-	local out = {}
-	for i = 1, #consts do
-		local v = consts[i]
-		if keepConst(v) then
-			out[#out + 1] = fmtConst(v)
-			if #out >= MAX_CONST_SHOW then
-				out[#out + 1] = "…(+more)"
-				break
-			end
-		end
-	end
-	-- also hash-style constants if present
-	if #consts == 0 then
-		for k, v in pairs(consts) do
-			if keepConst(v) then
-				out[#out + 1] = fmtConst(v)
-				if #out >= MAX_CONST_SHOW then
-					break
-				end
-			end
-		end
-	end
-	return out
+	return "{" .. table.concat(parts, ", ") .. "}"
 end
 
-local function collectUpvalues(fn)
-	if not getupvaluesFn then
-		warnOnce("getupvalues", "getupvalues missing — skip")
-		return {}
-	end
-	local ok, uvs = pcall(getupvaluesFn, fn)
-	if not ok or typeof(uvs) ~= "table" then
-		return { "__err:" .. tostring(uvs) }
-	end
-	local out = {}
-	local n = 0
-	for k, v in pairs(uvs) do
-		n += 1
-		local name = typeof(k) == "string" and k or ("[" .. tostring(k) .. "]")
-		local t = typeof(v)
-		local extra = ""
-		if t == "Instance" then
-			local ok2, path = pcall(function()
-				return v.ClassName .. ":" .. v:GetFullName()
-			end)
-			extra = ok2 and path or v.ClassName
-		elseif t == "function" then
-			extra = "fn"
-		elseif t == "table" then
-			extra = "table"
-		elseif t == "number" or t == "string" or t == "boolean" then
-			extra = fmtConst(v)
-		else
-			extra = t
-		end
-		out[#out + 1] = name .. "=" .. extra
-		if #out >= 40 then
-			out[#out + 1] = "…(+more)"
-			break
+local function interestingRemote(path)
+	local low = string.lower(path)
+	local keys = {
+		"speed",
+		"cheat",
+		"anti",
+		"move",
+		"viol",
+		"report",
+		"kick",
+		"ban",
+		"dist",
+		"tele",
+		"pos",
+		"valid",
+		"secure",
+		"moderat",
+		"exploit",
+		"flag",
+		"check",
+		"physic",
+		"replicat",
+	}
+	for i = 1, #keys do
+		if string.find(low, keys[i], 1, true) then
+			return true
 		end
 	end
-	return out
+	return false
 end
 
-local function isLuaFn(fn)
-	if typeof(fn) ~= "function" then
+local function onRemoteOut(path, method, args)
+	if not stepActive then
+		return
+	end
+	local hit = {
+		path = path,
+		method = method,
+		args = fmtArgs(args),
+		t = os.clock() - stepT0,
+		interesting = interestingRemote(path),
+	}
+	remoteHits[#remoteHits + 1] = hit
+	if hit.interesting then
+		log(string.format("  REMOTE %.2fs %s:%s %s", hit.t, method, path, hit.args), true)
+	end
+end
+
+local function installRemoteHook()
+	if #hooks > 0 then
+		return true
+	end
+	if not hookmm or not getnamecall then
+		log("hookmetamethod/getnamecallmethod missing — remotes not hooked", true)
 		return false
 	end
-	if islclosureFn then
-		local ok, r = pcall(islclosureFn, fn)
-		if ok then
-			return r and true or false
+	local ok, err = pcall(function()
+		local old
+		old = hookmm(game, "__namecall", newcclosure(function(self, ...)
+			local method = getnamecall()
+			if stepActive and typeof(self) == "Instance" then
+				if method == "FireServer" or method == "InvokeServer" then
+					if self:IsA("RemoteEvent") or self:IsA("RemoteFunction") or self:IsA("UnreliableRemoteEvent") then
+						local args = { ... }
+						local okp, path = pcall(function()
+							return self:GetFullName()
+						end)
+						onRemoteOut(okp and path or self.Name, method, args)
+					end
+				end
+			end
+			return old(self, ...)
+		end))
+		hooks[#hooks + 1] = true
+	end)
+	if not ok then
+		log("remote hook FAIL " .. tostring(err), true)
+		return false
+	end
+	log("remote FireServer/InvokeServer hook OK", true)
+	return true
+end
+
+local function watchKickSignals()
+	local pg = LP:FindFirstChild("PlayerGui")
+	if not pg then
+		return
+	end
+	return pg.DescendantAdded:Connect(function(d)
+		if not stepActive then
+			return
+		end
+		if not d:IsA("TextLabel") and not d:IsA("TextButton") and not d:IsA("TextBox") then
+			return
+		end
+		local t = string.lower(d.Text or "")
+		if t == "" then
+			return
+		end
+		if string.find(t, "kick", 1, true)
+			or string.find(t, "ban", 1, true)
+			or string.find(t, "exploit", 1, true)
+			or string.find(t, "cheat", 1, true)
+			or string.find(t, "teleport", 1, true)
+			or string.find(t, "violat", 1, true)
+		then
+			stepKick = true
+			stepNotes[#stepNotes + 1] = "UI:" .. string.sub(d.Text, 1, 60)
+			log("  UI warn: " .. string.sub(d.Text, 1, 80), true)
+		end
+	end)
+end
+
+local function bindDied()
+	if diedConn then
+		diedConn:Disconnect()
+		diedConn = nil
+	end
+	local hum = getHum()
+	if not hum then
+		return
+	end
+	diedConn = hum.Died:Connect(function()
+		if not stepActive then
+			return
+		end
+		stepDied = true
+		local age = os.clock() - stepT0
+		stepNotes[#stepNotes + 1] = string.format("DIED@%.2fs", age)
+		log(string.format("  DIED at +%.2fs", age), true)
+	end)
+end
+
+local function doTeleport(studs)
+	local hrp = getHrp()
+	if not hrp then
+		return nil, nil
+	end
+	local origin = hrp.Position
+	-- horizontal only: prefer LookVector flattened, fallback +X
+	local look = hrp.CFrame.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	if flat.Magnitude < 0.05 then
+		flat = Vector3.new(1, 0, 0)
+	else
+		flat = flat.Unit
+	end
+	local dest = origin + flat * studs
+	-- keep Y
+	dest = Vector3.new(dest.X, origin.Y, dest.Z)
+
+	pcall(function()
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+	end)
+	hrp.CFrame = CFrame.new(dest) * (hrp.CFrame - hrp.CFrame.Position)
+
+	return origin, dest
+end
+
+local function beginStep(dist, origin, target)
+	stepActive = true
+	stepDist = dist
+	stepT0 = os.clock()
+	stepOrigin = origin
+	stepTarget = target
+	stepReactAt = nil
+	stepMaxSnap = 0
+	stepClosestToOrigin = nil
+	stepFarthestFromOrigin = 0
+	stepDied = false
+	stepKick = false
+	stepNotes = {}
+	remoteHits = {}
+	lastPos = target
+end
+
+local function trackCorrection()
+	if not stepActive or not stepOrigin or not stepTarget then
+		return
+	end
+	local hrp = getHrp()
+	if not hrp then
+		return
+	end
+	local p = hrp.Position
+	local age = os.clock() - stepT0
+	local dOrig = (p - stepOrigin).Magnitude
+	local dTgt = (p - stepTarget).Magnitude
+
+	if stepClosestToOrigin == nil or dOrig < stepClosestToOrigin then
+		stepClosestToOrigin = dOrig
+	end
+	if dOrig > stepFarthestFromOrigin then
+		stepFarthestFromOrigin = dOrig
+	end
+
+	-- frame snap (server rubberband)
+	if lastPos then
+		local jump = (p - lastPos).Magnitude
+		if jump >= SNAP_STUD then
+			if jump > stepMaxSnap then
+				stepMaxSnap = jump
+			end
+			if not stepReactAt then
+				stepReactAt = age
+			end
+			local towardOrig = (lastPos - stepOrigin).Magnitude - (p - stepOrigin).Magnitude
+			local tag = towardOrig > 1 and "SNAPBACK" or "SNAP"
+			stepNotes[#stepNotes + 1] = string.format("%s=%.1f@%.2fs", tag, jump, age)
+			log(string.format("  %s %.1f stud at +%.2fs (dOrig=%.1f dTgt=%.1f)", tag, jump, age, dOrig, dTgt), true)
 		end
 	end
-	if iscclosureFn then
-		local ok, r = pcall(iscclosureFn, fn)
-		if ok and r then
+
+	-- gradual pull toward origin without huge frame jump
+	local intended = stepDist
+	if intended > 0 and dOrig < intended * (1 - BACK_FRAC) then
+		if not stepReactAt and age > 0.02 then
+			-- only if we actually left origin first
+			if stepFarthestFromOrigin >= intended * 0.5 then
+				stepReactAt = age
+				stepNotes[#stepNotes + 1] = string.format("PULL_BACK dOrig=%.1f@%.2fs", dOrig, age)
+				log(string.format("  PULL_BACK dOrig=%.1f at +%.2fs", dOrig, age), true)
+			end
+		end
+	end
+
+	lastPos = p
+end
+
+local function endStep()
+	stepActive = false
+	local hrp = getHrp()
+	local final = hrp and hrp.Position or nil
+	local dOrig = final and stepOrigin and (final - stepOrigin).Magnitude or -1
+	local dTgt = final and stepTarget and (final - stepTarget).Magnitude or -1
+	local held = (dTgt >= 0 and dTgt < 4) -- still near destination
+
+	local remLines = {}
+	for i = 1, #remoteHits do
+		local h = remoteHits[i]
+		if h.interesting then
+			remLines[#remLines + 1] = string.format("%s %s %s", h.method, h.path, h.args)
+		end
+	end
+
+	local line
+	if stepDied then
+		line = string.format(
+			"TP=%-3d → DIED react=%.2fs dOrig=%.1f dTgt=%.1f %s",
+			stepDist,
+			stepReactAt or (os.clock() - stepT0),
+			dOrig,
+			dTgt,
+			table.concat(stepNotes, "; ")
+		)
+	elseif stepKick then
+		line = string.format("TP=%-3d → KICK/WARN %s", stepDist, table.concat(stepNotes, "; "))
+	elseif stepReactAt then
+		line = string.format(
+			"TP=%-3d → CORRECTED react=%.2fs maxSnap=%.1f final dOrig=%.1f dTgt=%.1f %s",
+			stepDist,
+			stepReactAt,
+			stepMaxSnap,
+			dOrig,
+			dTgt,
+			table.concat(stepNotes, "; ")
+		)
+	elseif held then
+		line = string.format(
+			"TP=%-3d → HELD (no correction %.1fs) dOrig=%.1f dTgt=%.1f remotes=%d",
+			stepDist,
+			WATCH_SEC,
+			dOrig,
+			dTgt,
+			#remoteHits
+		)
+	else
+		line = string.format(
+			"TP=%-3d → drifted dOrig=%.1f dTgt=%.1f remotes=%d %s",
+			stepDist,
+			dOrig,
+			dTgt,
+			#remoteHits,
+			table.concat(stepNotes, "; ")
+		)
+	end
+
+	if #remLines > 0 then
+		line = line .. " | REMOTE " .. table.concat(remLines, " || ")
+	elseif #remoteHits > 0 and not string.find(line, "remotes=", 1, true) then
+		line = line .. string.format(" | %d remotes (none AC-named)", #remoteHits)
+	end
+
+	results[#results + 1] = { dist = stepDist, line = line }
+	log(line, true)
+	lastPos = nil
+	stepOrigin = nil
+	stepTarget = nil
+end
+
+local function waitSec(sec)
+	local t0 = os.clock()
+	while os.clock() - t0 < sec do
+		if abortFlag then
 			return false
 		end
+		trackCorrection()
+		task.wait()
 	end
 	return true
 end
 
-local function getScriptClosure(inst)
-	-- Delta often: getscriptclosure / getscriptfunction
-	local gsc = findApi("getscriptclosure", "getscriptfunction", "getscriptfromname")
-	if gsc then
-		local ok, fn = pcall(gsc, inst)
-		if ok and typeof(fn) == "function" then
-			return fn
-		end
+local function printSummary()
+	log("======== TELEPORT SUMMARY ========", true)
+	for i = 1, #results do
+		log(results[i].line, true)
 	end
-	-- fallback: scan getgc for functions with matching script
-	if getgcFn then
-		local ok, gc = pcall(getgcFn, false)
-		if ok and typeof(gc) == "table" then
-			for i = 1, #gc do
-				local fn = gc[i]
-				if typeof(fn) == "function" and isLuaFn(fn) then
-					local ok2, info = pcall(function()
-						if debug and debug.info then
-							return debug.info(fn, "s")
-						end
-						return nil
-					end)
-					-- weak match: try debug.getinfo source
-					local matched = false
-					if getinfoFn then
-						local ok3, inf = pcall(getinfoFn, fn)
-						if ok3 and typeof(inf) == "table" then
-							local src = inf.source or inf.short_src or ""
-							if typeof(src) == "string" and string.find(src, inst.Name, 1, true) then
-								matched = true
-							end
-						end
-					end
-					if matched then
-						return fn
-					end
-				end
-			end
-		end
-	end
-	return nil
-end
-
-local function dumpProtoTree(fn, depth, prefix)
-	if abortFlag or depth > MAX_PROTO_DEPTH then
-		return
-	end
-	if not getprotosFn then
-		warnOnce("getprotos", "getprotos missing — skip")
-		return
-	end
-	local ok, protos = pcall(getprotosFn, fn)
-	if not ok or typeof(protos) ~= "table" then
-		log(prefix .. "protos: ERR " .. tostring(protos))
-		return
-	end
-	local count = #protos
-	if count == 0 then
-		local c = 0
-		for _ in pairs(protos) do
-			c += 1
-		end
-		count = c
-	end
-	log(prefix .. "protos: " .. tostring(count))
-	local i = 0
-	for _, proto in pairs(protos) do
-		i += 1
-		if i > MAX_PROTOS then
-			log(prefix .. "  …(+more protos)")
+	local firstHit = nil
+	for i = 1, #results do
+		local L = results[i].line
+		if string.find(L, "CORRECTED", 1, true)
+			or string.find(L, "DIED", 1, true)
+			or string.find(L, "KICK", 1, true)
+		then
+			firstHit = results[i].dist
 			break
 		end
-		if typeof(proto) == "function" then
-			local consts = collectConstants(proto)
-			local uvs = collectUpvalues(proto)
-			log(prefix .. string.format("  proto[%d] constants: [%s]", i, table.concat(consts, ", ")))
-			log(prefix .. string.format("  proto[%d] upvalues: [%s]", i, table.concat(uvs, ", ")))
-			if depth < MAX_PROTO_DEPTH then
-				dumpProtoTree(proto, depth + 1, prefix .. "  ")
-			end
-		end
-		if abortFlag then
-			return
-		end
 	end
-end
-
-local function dumpConnectionsOnScript(inst)
-	-- Limit: try Actor/script.Destroyed etc is noise. Look for ModuleScript returned signals via upvalues later.
-	-- If getconnections available, try Heartbeat connections whose Function belongs to this script — too heavy.
-	-- Instead: only if script has known BindableEvent children
-	if not getconnectionsFn then
-		warnOnce("getconnections", "getconnections missing — skip")
-		return
-	end
-	local interesting = {}
-	for _, d in ipairs(inst:GetDescendants()) do
-		if d:IsA("BindableEvent") or d:IsA("BindableFunction") or d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
-			interesting[#interesting + 1] = d
-		end
-	end
-	if #interesting == 0 then
-		log("connections: (no bindable/remote children under script)")
-		return
-	end
-	for i = 1, #interesting do
-		local obj = interesting[i]
-		local signals = {}
-		if obj:IsA("BindableEvent") or obj:IsA("RemoteEvent") or obj:IsA("UnreliableRemoteEvent") then
-			signals = { "Event", "OnClientEvent", "OnServerEvent" }
-		elseif obj:IsA("BindableFunction") or obj:IsA("RemoteFunction") then
-			signals = { "OnInvoke", "OnClientInvoke", "OnServerInvoke" }
-		end
-		for s = 1, #signals do
-			local ok, sig = pcall(function()
-				return obj[signals[s]]
-			end)
-			if ok and sig ~= nil then
-				local ok2, conns = pcall(getconnectionsFn, sig)
-				if ok2 and typeof(conns) == "table" then
-					log(string.format("connections %s.%s count=%d", obj:GetFullName(), signals[s], #conns))
-				end
-			end
-		end
-	end
-end
-
-local function findScript(name, where)
-	local hits = {}
-	local function add(inst)
-		if inst and (inst:IsA("LocalScript") or inst:IsA("ModuleScript") or inst:IsA("Script")) then
-			hits[#hits + 1] = inst
-		end
-	end
-	if where == "char" then
-		local char = LP.Character
-		if char then
-			add(char:FindFirstChild(name, true))
-		end
-		local scs = game:GetService("StarterPlayer"):FindFirstChild("StarterCharacterScripts")
-		if scs then
-			add(scs:FindFirstChild(name, true))
-		end
-	elseif where == "ps" then
-		local ps = LP:FindFirstChild("PlayerScripts")
-		if ps then
-			add(ps:FindFirstChild(name, true))
-		end
-		local sps = game:GetService("StarterPlayer"):FindFirstChild("StarterPlayerScripts")
-		if sps then
-			add(sps:FindFirstChild(name, true))
-		end
-	end
-	-- dedupe
-	local seen, uniq = {}, {}
-	for i = 1, #hits do
-		if hits[i] and not seen[hits[i]] then
-			seen[hits[i]] = true
-			uniq[#uniq + 1] = hits[i]
-		end
-	end
-	return uniq
-end
-
-local function processScript(inst)
-	local path = inst:GetFullName()
-	log("=== " .. inst.Name .. " ===", true)
-	log("path=" .. path .. " class=" .. inst.ClassName)
-
-	-- bytecode
-	if getsbFn then
-		local ok, bc = pcall(getsbFn, inst)
-		if ok and typeof(bc) == "string" then
-			log("bytecode len=" .. #bc)
-		else
-			log("bytecode FAIL: " .. tostring(bc))
-		end
+	if firstHit then
+		log(string.format("first reaction at TP>=%d stud", firstHit), true)
 	else
-		warnOnce("bytecode", "getscriptbytecode missing — skip")
-		log("bytecode len=?")
+		log("no server correction observed in ladder", true)
 	end
-
-	local fn = getScriptClosure(inst)
-	if not fn then
-		log("closure: NOT FOUND (getscriptclosure/getgc failed)", true)
-		dumpConnectionsOnScript(inst)
-		return
-	end
-	log("closure: OK")
-
-	local consts = collectConstants(fn)
-	log("constants: [" .. table.concat(consts, ", ") .. "]")
-
-	local uvs = collectUpvalues(fn)
-	log("upvalues: [" .. table.concat(uvs, ", ") .. "]")
-
-	dumpProtoTree(fn, 1, "")
-
-	dumpConnectionsOnScript(inst)
+	log("======== END SUMMARY ========", true)
 end
 
-local function runAll()
+local function runLadder()
+	results = {}
 	abortFlag = false
-	apiWarn = {}
-	log(
-		string.format(
-			"apis: bytecode=%s const=%s protos=%s upvals=%s conn=%s gsc=%s",
-			tostring(getsbFn ~= nil),
-			tostring(getconstantsFn ~= nil),
-			tostring(getprotosFn ~= nil),
-			tostring(getupvaluesFn ~= nil),
-			tostring(getconnectionsFn ~= nil),
-			tostring(findApi("getscriptclosure", "getscriptfunction") ~= nil)
-		),
-		true
-	)
+	installRemoteHook()
+	local kickConn = watchKickSignals()
+	bindDied()
 
-	if not LP.Character then
-		log("waiting Character…", true)
-		LP.CharacterAdded:Wait()
-		task.wait(0.4)
+	if not getHum() or not getHrp() then
+		log("NO CHARACTER — spawn first", true)
+		setStatus("no character", COL.bad)
+		return
 	end
 
-	for i = 1, #TARGETS do
+	log("LADDER start — stand still, open area", true)
+	if not waitSec(0.4) then
+		return
+	end
+
+	for i = 1, #LADDER do
 		if abortFlag then
 			break
 		end
-		local t = TARGETS[i]
-		setStatus("dump " .. t.name, COL.accent)
-		local hits = findScript(t.name, t.where)
-		if #hits == 0 then
-			log("=== " .. t.name .. " === NOT FOUND", true)
-		else
-			processScript(hits[1])
+		if not getHrp() or not getHum() or getHum().Health <= 0 then
+			log("character gone — abort", true)
+			break
 		end
-		task.wait()
+
+		local dist = LADDER[i]
+		setStatus(string.format("TP %d stud …", dist), COL.accent)
+		log(string.format("--- TP %d stud watch=%.1fs ---", dist, WATCH_SEC))
+
+		local origin, target = doTeleport(dist)
+		if not origin then
+			log(string.format("TP=%-3d → FAIL no HRP", dist), true)
+			results[#results + 1] = { dist = dist, line = string.format("TP=%-3d → FAIL no HRP", dist) }
+			break
+		end
+
+		beginStep(dist, origin, target)
+		log(string.format("  warped +%d → (%.1f,%.1f,%.1f)", dist, target.X, target.Y, target.Z))
+
+		if not waitSec(WATCH_SEC) then
+			endStep()
+			break
+		end
+		endStep()
+
+		-- pause between hops (stay where we are — no forced return)
+		setStatus(string.format("pause %.1fs", RESET_SEC), COL.muted)
+		if not waitSec(RESET_SEC) then
+			break
+		end
+
+		-- rebind died if respawned mid-run
+		bindDied()
 	end
-	log("======== DUMP DONE ========", true)
+
+	if kickConn then
+		kickConn:Disconnect()
+	end
+	if diedConn then
+		diedConn:Disconnect()
+		diedConn = nil
+	end
+	printSummary()
 end
 
 local function stop()
 	abortFlag = true
 	running = false
+	stepActive = false
 	paintRun()
 	setStatus("stopped", COL.muted)
 	log("STOP", true)
@@ -533,11 +586,16 @@ local function start()
 		stop()
 		return
 	end
+	if not LP.Character or not getHum() then
+		log("Wait for character…", true)
+		LP.CharacterAdded:Wait()
+		task.wait(0.3)
+	end
 	running = true
 	paintRun()
-	log("START constants/connections dump", true)
+	log("START Probe 3 — teleport ladder (stay still between hops)", true)
 	task.spawn(function()
-		local ok, err = pcall(runAll)
+		local ok, err = pcall(runLadder)
 		if not ok then
 			log("CRASH " .. tostring(err), true)
 		end
@@ -582,21 +640,21 @@ end
 
 local function buildGui()
 	local pg = LP:FindFirstChild("PlayerGui") or LP:WaitForChild("PlayerGui")
-	local old = pg:FindFirstChild("ACConstDumpUI")
+	local old = pg:FindFirstChild("ACProbe3UI")
 	if old then
 		old:Destroy()
 	end
 
 	local gui = mk("ScreenGui", {
-		Name = "ACConstDumpUI",
+		Name = "ACProbe3UI",
 		ResetOnSpawn = false,
-		DisplayOrder = 124,
+		DisplayOrder = 122,
 		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 	}, pg)
 
 	local root = mk("Frame", {
-		Size = UDim2.fromOffset(360, 320),
-		Position = UDim2.fromOffset(16, 90),
+		Size = UDim2.fromOffset(340, 300),
+		Position = UDim2.fromOffset(16, 100),
 		BackgroundColor3 = COL.panel,
 		BorderSizePixel = 0,
 		Active = true,
@@ -621,7 +679,7 @@ local function buildGui()
 		TextSize = 14,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextColor3 = COL.text,
-		Text = "AC Probe — Constants Dump",
+		Text = "AC Probe 3 — Teleport",
 		LayoutOrder = 1,
 	}, root)
 
@@ -643,12 +701,12 @@ local function buildGui()
 		TextSize = 11,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextColor3 = COL.muted,
-		Text = "Delta — spawn in, then START",
+		Text = "Delta — open area, stand still, START",
 		LayoutOrder = 3,
 	}, root)
 
 	local shell = mk("Frame", {
-		Size = UDim2.new(1, 0, 0, 180),
+		Size = UDim2.new(1, 0, 0, 160),
 		BackgroundColor3 = COL.btn,
 		BorderSizePixel = 0,
 		ClipsDescendants = true,
@@ -663,11 +721,11 @@ local function buildGui()
 		BorderSizePixel = 0,
 		ScrollBarThickness = 4,
 		ScrollBarImageColor3 = COL.accent,
-		CanvasSize = UDim2.fromOffset(0, 2200),
+		CanvasSize = UDim2.fromOffset(0, 1200),
 	}, shell)
 
 	logBox = mk("TextLabel", {
-		Size = UDim2.new(1, -4, 0, 2200),
+		Size = UDim2.new(1, -4, 0, 1200),
 		Position = UDim2.fromOffset(2, 2),
 		BackgroundTransparency = 1,
 		Text = "",
@@ -724,4 +782,7 @@ local function buildGui()
 end
 
 buildGui()
-log("ready — constants/connections (Delta)", true)
+log("ready — Probe 3 teleport ladder (Delta)", true)
+if not hookmm then
+	log("WARNING: no hookmetamethod — remotes limited", true)
+end
