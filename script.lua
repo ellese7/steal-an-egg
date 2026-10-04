@@ -1,14 +1,16 @@
 -- ==================================================
---  Steal a Pet — AC Research Probe Decompile (Delta)
---  AntiCollisionHighSeedPushBack / Kernel / ContentCatalog
+--  Steal a Pet — AC Research Probe Constants/Connections (Delta)
+--  AntiCollisionHighSeedPushBack / FixCollisions / Kernel
 -- ==================================================
 
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer
 
-local MAX_LINES = 400
-local LOG_VIEW = 80
-local CHUNK = 900 -- chars per log block
+local MAX_LINES = 350
+local LOG_VIEW = 90
+local MAX_PROTO_DEPTH = 2
+local MAX_CONST_SHOW = 80
+local MAX_PROTOS = 40
 
 local COL = {
 	panel = Color3.fromRGB(13, 15, 20),
@@ -24,17 +26,17 @@ local COL = {
 	bad = Color3.fromRGB(220, 80, 80),
 }
 
+local TARGETS = {
+	{ name = "AntiCollisionHighSeedPushBack", where = "char" },
+	{ name = "FixCollisions", where = "char" },
+	{ name = "Kernel", where = "ps" },
+}
+
 local running = false
 local abortFlag = false
 local lines = {}
 local statusLbl, runBtn, logBox
-
-local TARGETS = {
-	{ name = "AntiCollisionHighSeedPushBack", find = "char" },
-	{ name = "Kernel", find = "playerscripts" },
-	{ name = "ContentCatalog", find = "any" },
-	{ name = "ActiveAssetsController", find = "any" },
-}
+local apiWarn = {}
 
 local function findApi(...)
 	local names = { ... }
@@ -57,9 +59,28 @@ local function findApi(...)
 end
 
 local setclipFn = findApi("setclipboard", "toclipboard", "setrbxclipboard")
-local decompileFn = findApi("decompile")
 local getsbFn = findApi("getscriptbytecode", "dumpstring")
+local getconstantsFn = findApi("getconstants", "debug.getconstants")
+local getprotosFn = findApi("getprotos", "debug.getprotos")
+local getupvaluesFn = findApi("getupvalues", "debug.getupvalues")
+local getinfoFn = findApi("getinfo", "debug.getinfo", "debug.info")
+local getconnectionsFn = findApi("getconnections")
 local getgcFn = findApi("getgc")
+local islclosureFn = findApi("islclosure")
+local iscclosureFn = findApi("iscclosure")
+
+-- debug library fallbacks
+pcall(function()
+	if not getconstantsFn and debug and debug.getconstants then
+		getconstantsFn = debug.getconstants
+	end
+	if not getprotosFn and debug and debug.getprotos then
+		getprotosFn = debug.getprotos
+	end
+	if not getupvaluesFn and debug and debug.getupvalues then
+		getupvaluesFn = debug.getupvalues
+	end
+end)
 
 local function refreshLogBox()
 	if not logBox then
@@ -104,223 +125,95 @@ local function paintRun()
 	end
 end
 
-local function dumpBlocks(label, text)
-	if typeof(text) ~= "string" or #text == 0 then
-		log(label .. " EMPTY", true)
+local function warnOnce(key, msg)
+	if apiWarn[key] then
 		return
 	end
-	log(string.format("%s len=%d", label, #text), true)
-	local n = math.ceil(#text / CHUNK)
-	-- max 12 blocks per script to avoid spam
-	local maxB = math.min(n, 12)
-	for i = 1, maxB do
-		local a = (i - 1) * CHUNK + 1
-		local b = math.min(#text, i * CHUNK)
-		log(string.format("--- %s [%d/%d] ---", label, i, maxB))
-		log(string.sub(text, a, b))
-		if abortFlag then
-			return
-		end
-		task.wait()
-	end
-	if n > maxB then
-		log(string.format("%s TRUNCATED (+%d blocks not shown)", label, n - maxB), true)
-	end
+	apiWarn[key] = true
+	log("API " .. msg, true)
 end
 
-local function extractHints(src)
-	if typeof(src) ~= "string" then
-		return
+local function keepConst(v)
+	local t = typeof(v)
+	if t == "string" then
+		if #v < 3 then
+			return false
+		end
+		local skip = {
+			["true"] = true,
+			["false"] = true,
+			["nil"] = true,
+			["and"] = true,
+			["or"] = true,
+		}
+		if skip[v] then
+			return false
+		end
+		return true
+	elseif t == "number" then
+		if v == 0 or v == 1 or v == -1 then
+			return false
+		end
+		return true
+	elseif t == "boolean" then
+		return false
+	elseif t == "vector" or t == "Vector3" then
+		return true
 	end
-	local hints = {}
-	-- remotes / strings of interest
-	for w in string.gmatch(src, "[%w_]*[Rr]emote[%w_]*") do
-		hints[w] = true
+	return t ~= "nil"
+end
+
+local function fmtConst(v)
+	local t = typeof(v)
+	if t == "string" then
+		local s = v
+		if #s > 60 then
+			s = string.sub(s, 1, 57) .. "…"
+		end
+		return string.format("%q", s)
+	elseif t == "number" then
+		return string.format("%.6g", v)
+	elseif t == "Instance" then
+		local ok, n = pcall(function()
+			return v:GetFullName()
+		end)
+		return "Instance:" .. (ok and n or v.ClassName)
+	elseif t == "function" then
+		return "function"
+	elseif t == "table" then
+		return "table"
+	elseif t == "Vector3" then
+		return string.format("V3(%.1f,%.1f,%.1f)", v.X, v.Y, v.Z)
 	end
-	for w in string.gmatch(src, "FireServer") do
-		hints[w] = true
+	return t .. ":" .. tostring(v)
+end
+
+local function collectConstants(fn)
+	if not getconstantsFn then
+		warnOnce("getconstants", "getconstants missing — skip")
+		return {}
 	end
-	for w in string.gmatch(src, "InvokeServer") do
-		hints[w] = true
+	local ok, consts = pcall(getconstantsFn, fn)
+	if not ok or typeof(consts) ~= "table" then
+		return { "__err:" .. tostring(consts) }
 	end
-	for w in string.gmatch(src, "WalkSpeed") do
-		hints[w] = true
-	end
-	for w in string.gmatch(src, "AssemblyLinearVelocity") do
-		hints[w] = true
-	end
-	for w in string.gmatch(src, "CFrame") do
-		hints[w] = true
-	end
-	for w in string.gmatch(src, "[%w_/]*[Aa]nti[%w_]*") do
-		hints[w] = true
-	end
-	for w in string.gmatch(src, "[%w_]*[Ss]peed[%w_]*") do
-		hints[w] = true
-	end
-	for w in string.gmatch(src, "[%w_]*[Kk]ick[%w_]*") do
-		hints[w] = true
-	end
-	for w in string.gmatch(src, "[%w_]*[Pp]ush[%w_]*") do
-		hints[w] = true
-	end
-	-- quoted strings (short)
-	local nStr = 0
-	for s in string.gmatch(src, '"([^"][%w%s%._%-/][^"]-)"') do
-		if #s >= 3 and #s <= 64 then
-			hints['"' .. s .. '"'] = true
-			nStr += 1
-			if nStr > 25 then
+	local out = {}
+	for i = 1, #consts do
+		local v = consts[i]
+		if keepConst(v) then
+			out[#out + 1] = fmtConst(v)
+			if #out >= MAX_CONST_SHOW then
+				out[#out + 1] = "…(+more)"
 				break
 			end
 		end
 	end
-	local list = {}
-	for k in pairs(hints) do
-		list[#list + 1] = k
-	end
-	table.sort(list)
-	if #list > 0 then
-		log("HINTS: " .. table.concat(list, ", "), true)
-	else
-		log("HINTS: (none extracted)", true)
-	end
-end
-
-local function tryDecompile(inst)
-	if not decompileFn then
-		return nil, "decompile API missing"
-	end
-	local ok, res = pcall(decompileFn, inst)
-	if ok and typeof(res) == "string" and #res > 0 then
-		return res, nil
-	end
-	return nil, tostring(res)
-end
-
-local function tryBytecode(inst)
-	if not getsbFn then
-		return nil, "getscriptbytecode missing"
-	end
-	local ok, res = pcall(getsbFn, inst)
-	if ok and typeof(res) == "string" then
-		return res, nil
-	end
-	return nil, tostring(res)
-end
-
-local function findByName(name, mode)
-	local hits = {}
-	local function consider(inst)
-		if inst.Name ~= name then
-			return
-		end
-		if not (inst:IsA("LocalScript") or inst:IsA("ModuleScript") or inst:IsA("Script")) then
-			-- sometimes the LocalScript is a child with same name, or folder
-			return
-		end
-		hits[#hits + 1] = inst
-	end
-
-	if mode == "char" then
-		local char = LP.Character
-		if char then
-			for _, d in ipairs(char:GetDescendants()) do
-				consider(d)
-				if d.Name == name then
-					-- also collect parent scripts
-					for _, c in ipairs(d:GetDescendants()) do
-						consider(c)
-					end
-					if d:IsA("LocalScript") or d:IsA("ModuleScript") then
-						hits[#hits + 1] = d
-					end
-				end
-			end
-			-- name match even if not script class (clone of LocalScript sometimes)
-			local node = char:FindFirstChild(name, true)
-			if node then
-				if node:IsA("LocalScript") or node:IsA("ModuleScript") or node:IsA("Script") then
-					hits[#hits + 1] = node
-				end
-				for _, c in ipairs(node:GetChildren()) do
-					consider(c)
-				end
-				log("FOUND node " .. node:GetFullName() .. " class=" .. node.ClassName, true)
-			end
-		end
-	elseif mode == "playerscripts" then
-		local ps = LP:FindFirstChild("PlayerScripts")
-		if ps then
-			local n = ps:FindFirstChild(name, true)
-			if n then
-				log("FOUND " .. n:GetFullName() .. " class=" .. n.ClassName, true)
-				if n:IsA("LocalScript") or n:IsA("ModuleScript") or n:IsA("Script") then
-					hits[#hits + 1] = n
-				end
-				for _, c in ipairs(n:GetDescendants()) do
-					consider(c)
-				end
-			end
-		end
-	end
-
-	-- global scan fallback
-	local roots = {
-		game:GetService("ReplicatedStorage"),
-		game:GetService("StarterPlayer"),
-		LP:FindFirstChild("PlayerScripts"),
-		LP:FindFirstChild("PlayerGui"),
-		LP.Character,
-	}
-	for _, root in ipairs(roots) do
-		if root then
-			local ok, list = pcall(function()
-				return root:GetDescendants()
-			end)
-			if ok then
-				for _, d in ipairs(list) do
-					if d.Name == name and (d:IsA("LocalScript") or d:IsA("ModuleScript") or d:IsA("Script")) then
-						hits[#hits + 1] = d
-					end
-				end
-			end
-		end
-	end
-
-	-- dedupe
-	local seen = {}
-	local uniq = {}
-	for i = 1, #hits do
-		local h = hits[i]
-		if not seen[h] then
-			seen[h] = true
-			uniq[#uniq + 1] = h
-		end
-	end
-	return uniq
-end
-
-local function scanGcForName(name)
-	if not getgcFn then
-		return {}
-	end
-	local out = {}
-	local ok, gc = pcall(getgcFn, true)
-	if not ok or typeof(gc) ~= "table" then
-		return out
-	end
-	local n = 0
-	for i = 1, #gc do
-		local v = gc[i]
-		if typeof(v) == "Instance" and (v:IsA("LocalScript") or v:IsA("ModuleScript")) then
-			local okn, nm = pcall(function()
-				return v.Name
-			end)
-			if okn and nm == name then
-				out[#out + 1] = v
-				n += 1
-				if n >= 5 then
+	-- also hash-style constants if present
+	if #consts == 0 then
+		for k, v in pairs(consts) do
+			if keepConst(v) then
+				out[#out + 1] = fmtConst(v)
+				if #out >= MAX_CONST_SHOW then
 					break
 				end
 			end
@@ -329,85 +222,302 @@ local function scanGcForName(name)
 	return out
 end
 
-local function processScript(inst)
-	local path = "?"
-	pcall(function()
-		path = inst:GetFullName()
-	end)
-	log("======== TARGET " .. path .. " (" .. inst.ClassName .. ") ========", true)
+local function collectUpvalues(fn)
+	if not getupvaluesFn then
+		warnOnce("getupvalues", "getupvalues missing — skip")
+		return {}
+	end
+	local ok, uvs = pcall(getupvaluesFn, fn)
+	if not ok or typeof(uvs) ~= "table" then
+		return { "__err:" .. tostring(uvs) }
+	end
+	local out = {}
+	local n = 0
+	for k, v in pairs(uvs) do
+		n += 1
+		local name = typeof(k) == "string" and k or ("[" .. tostring(k) .. "]")
+		local t = typeof(v)
+		local extra = ""
+		if t == "Instance" then
+			local ok2, path = pcall(function()
+				return v.ClassName .. ":" .. v:GetFullName()
+			end)
+			extra = ok2 and path or v.ClassName
+		elseif t == "function" then
+			extra = "fn"
+		elseif t == "table" then
+			extra = "table"
+		elseif t == "number" or t == "string" or t == "boolean" then
+			extra = fmtConst(v)
+		else
+			extra = t
+		end
+		out[#out + 1] = name .. "=" .. extra
+		if #out >= 40 then
+			out[#out + 1] = "…(+more)"
+			break
+		end
+	end
+	return out
+end
 
-	-- parent context
-	if inst.Parent then
-		log("parent=" .. inst.Parent:GetFullName() .. " (" .. inst.Parent.ClassName .. ")")
-		for _, sib in ipairs(inst.Parent:GetChildren()) do
-			if sib:IsA("LocalScript") or sib:IsA("ModuleScript") or sib:IsA("Script") then
-				log("  sibling script: " .. sib.Name .. " (" .. sib.ClassName .. ")")
+local function isLuaFn(fn)
+	if typeof(fn) ~= "function" then
+		return false
+	end
+	if islclosureFn then
+		local ok, r = pcall(islclosureFn, fn)
+		if ok then
+			return r and true or false
+		end
+	end
+	if iscclosureFn then
+		local ok, r = pcall(iscclosureFn, fn)
+		if ok and r then
+			return false
+		end
+	end
+	return true
+end
+
+local function getScriptClosure(inst)
+	-- Delta often: getscriptclosure / getscriptfunction
+	local gsc = findApi("getscriptclosure", "getscriptfunction", "getscriptfromname")
+	if gsc then
+		local ok, fn = pcall(gsc, inst)
+		if ok and typeof(fn) == "function" then
+			return fn
+		end
+	end
+	-- fallback: scan getgc for functions with matching script
+	if getgcFn then
+		local ok, gc = pcall(getgcFn, false)
+		if ok and typeof(gc) == "table" then
+			for i = 1, #gc do
+				local fn = gc[i]
+				if typeof(fn) == "function" and isLuaFn(fn) then
+					local ok2, info = pcall(function()
+						if debug and debug.info then
+							return debug.info(fn, "s")
+						end
+						return nil
+					end)
+					-- weak match: try debug.getinfo source
+					local matched = false
+					if getinfoFn then
+						local ok3, inf = pcall(getinfoFn, fn)
+						if ok3 and typeof(inf) == "table" then
+							local src = inf.source or inf.short_src or ""
+							if typeof(src) == "string" and string.find(src, inst.Name, 1, true) then
+								matched = true
+							end
+						end
+					end
+					if matched then
+						return fn
+					end
+				end
 			end
 		end
 	end
+	return nil
+end
 
-	local src, err = tryDecompile(inst)
-	if src then
-		extractHints(src)
-		dumpBlocks("DECOMPILE " .. inst.Name, src)
-	else
-		log("DECOMPILE FAIL: " .. tostring(err), true)
-		local bc, berr = tryBytecode(inst)
-		if bc then
-			log(string.format("BYTECODE ok len=%d (hex head)", #bc), true)
-			local head = {}
-			for i = 1, math.min(32, #bc) do
-				head[#head + 1] = string.format("%02X", string.byte(bc, i))
+local function dumpProtoTree(fn, depth, prefix)
+	if abortFlag or depth > MAX_PROTO_DEPTH then
+		return
+	end
+	if not getprotosFn then
+		warnOnce("getprotos", "getprotos missing — skip")
+		return
+	end
+	local ok, protos = pcall(getprotosFn, fn)
+	if not ok or typeof(protos) ~= "table" then
+		log(prefix .. "protos: ERR " .. tostring(protos))
+		return
+	end
+	local count = #protos
+	if count == 0 then
+		local c = 0
+		for _ in pairs(protos) do
+			c += 1
+		end
+		count = c
+	end
+	log(prefix .. "protos: " .. tostring(count))
+	local i = 0
+	for _, proto in pairs(protos) do
+		i += 1
+		if i > MAX_PROTOS then
+			log(prefix .. "  …(+more protos)")
+			break
+		end
+		if typeof(proto) == "function" then
+			local consts = collectConstants(proto)
+			local uvs = collectUpvalues(proto)
+			log(prefix .. string.format("  proto[%d] constants: [%s]", i, table.concat(consts, ", ")))
+			log(prefix .. string.format("  proto[%d] upvalues: [%s]", i, table.concat(uvs, ", ")))
+			if depth < MAX_PROTO_DEPTH then
+				dumpProtoTree(proto, depth + 1, prefix .. "  ")
 			end
-			log("BC: " .. table.concat(head, " "))
-		else
-			log("BYTECODE FAIL: " .. tostring(berr), true)
+		end
+		if abortFlag then
+			return
 		end
 	end
 end
 
-local function runAll()
-	abortFlag = false
-	if not decompileFn then
-		log("CRITICAL: decompile() not found in Delta env", true)
-		setStatus("no decompile", COL.bad)
+local function dumpConnectionsOnScript(inst)
+	-- Limit: try Actor/script.Destroyed etc is noise. Look for ModuleScript returned signals via upvalues later.
+	-- If getconnections available, try Heartbeat connections whose Function belongs to this script — too heavy.
+	-- Instead: only if script has known BindableEvent children
+	if not getconnectionsFn then
+		warnOnce("getconnections", "getconnections missing — skip")
 		return
 	end
-	log("decompile=OK getscriptbytecode=" .. tostring(getsbFn ~= nil) .. " getgc=" .. tostring(getgcFn ~= nil), true)
+	local interesting = {}
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("BindableEvent") or d:IsA("BindableFunction") or d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+			interesting[#interesting + 1] = d
+		end
+	end
+	if #interesting == 0 then
+		log("connections: (no bindable/remote children under script)")
+		return
+	end
+	for i = 1, #interesting do
+		local obj = interesting[i]
+		local signals = {}
+		if obj:IsA("BindableEvent") or obj:IsA("RemoteEvent") or obj:IsA("UnreliableRemoteEvent") then
+			signals = { "Event", "OnClientEvent", "OnServerEvent" }
+		elseif obj:IsA("BindableFunction") or obj:IsA("RemoteFunction") then
+			signals = { "OnInvoke", "OnClientInvoke", "OnServerInvoke" }
+		end
+		for s = 1, #signals do
+			local ok, sig = pcall(function()
+				return obj[signals[s]]
+			end)
+			if ok and sig ~= nil then
+				local ok2, conns = pcall(getconnectionsFn, sig)
+				if ok2 and typeof(conns) == "table" then
+					log(string.format("connections %s.%s count=%d", obj:GetFullName(), signals[s], #conns))
+				end
+			end
+		end
+	end
+end
+
+local function findScript(name, where)
+	local hits = {}
+	local function add(inst)
+		if inst and (inst:IsA("LocalScript") or inst:IsA("ModuleScript") or inst:IsA("Script")) then
+			hits[#hits + 1] = inst
+		end
+	end
+	if where == "char" then
+		local char = LP.Character
+		if char then
+			add(char:FindFirstChild(name, true))
+		end
+		local scs = game:GetService("StarterPlayer"):FindFirstChild("StarterCharacterScripts")
+		if scs then
+			add(scs:FindFirstChild(name, true))
+		end
+	elseif where == "ps" then
+		local ps = LP:FindFirstChild("PlayerScripts")
+		if ps then
+			add(ps:FindFirstChild(name, true))
+		end
+		local sps = game:GetService("StarterPlayer"):FindFirstChild("StarterPlayerScripts")
+		if sps then
+			add(sps:FindFirstChild(name, true))
+		end
+	end
+	-- dedupe
+	local seen, uniq = {}, {}
+	for i = 1, #hits do
+		if hits[i] and not seen[hits[i]] then
+			seen[hits[i]] = true
+			uniq[#uniq + 1] = hits[i]
+		end
+	end
+	return uniq
+end
+
+local function processScript(inst)
+	local path = inst:GetFullName()
+	log("=== " .. inst.Name .. " ===", true)
+	log("path=" .. path .. " class=" .. inst.ClassName)
+
+	-- bytecode
+	if getsbFn then
+		local ok, bc = pcall(getsbFn, inst)
+		if ok and typeof(bc) == "string" then
+			log("bytecode len=" .. #bc)
+		else
+			log("bytecode FAIL: " .. tostring(bc))
+		end
+	else
+		warnOnce("bytecode", "getscriptbytecode missing — skip")
+		log("bytecode len=?")
+	end
+
+	local fn = getScriptClosure(inst)
+	if not fn then
+		log("closure: NOT FOUND (getscriptclosure/getgc failed)", true)
+		dumpConnectionsOnScript(inst)
+		return
+	end
+	log("closure: OK")
+
+	local consts = collectConstants(fn)
+	log("constants: [" .. table.concat(consts, ", ") .. "]")
+
+	local uvs = collectUpvalues(fn)
+	log("upvalues: [" .. table.concat(uvs, ", ") .. "]")
+
+	dumpProtoTree(fn, 1, "")
+
+	dumpConnectionsOnScript(inst)
+end
+
+local function runAll()
+	abortFlag = false
+	apiWarn = {}
+	log(
+		string.format(
+			"apis: bytecode=%s const=%s protos=%s upvals=%s conn=%s gsc=%s",
+			tostring(getsbFn ~= nil),
+			tostring(getconstantsFn ~= nil),
+			tostring(getprotosFn ~= nil),
+			tostring(getupvaluesFn ~= nil),
+			tostring(getconnectionsFn ~= nil),
+			tostring(findApi("getscriptclosure", "getscriptfunction") ~= nil)
+		),
+		true
+	)
 
 	if not LP.Character then
 		log("waiting Character…", true)
 		LP.CharacterAdded:Wait()
-		task.wait(0.5)
+		task.wait(0.4)
 	end
 
-	for t = 1, #TARGETS do
+	for i = 1, #TARGETS do
 		if abortFlag then
 			break
 		end
-		local spec = TARGETS[t]
-		setStatus("decompile " .. spec.name .. "…", COL.accent)
-		log("---- search " .. spec.name .. " ----", true)
-		local hits = findByName(spec.name, spec.find)
+		local t = TARGETS[i]
+		setStatus("dump " .. t.name, COL.accent)
+		local hits = findScript(t.name, t.where)
 		if #hits == 0 then
-			local gcHits = scanGcForName(spec.name)
-			for i = 1, #gcHits do
-				hits[#hits + 1] = gcHits[i]
-			end
-		end
-		if #hits == 0 then
-			log("NOT FOUND: " .. spec.name, true)
+			log("=== " .. t.name .. " === NOT FOUND", true)
 		else
-			log(string.format("found %d instance(s) for %s", #hits, spec.name), true)
-			for i = 1, math.min(#hits, 3) do
-				processScript(hits[i])
-				task.wait(0.05)
-			end
+			processScript(hits[1])
 		end
+		task.wait()
 	end
-
-	log("======== DECOMPILE DONE ========", true)
-	log("Paste Copy log here for analysis", true)
+	log("======== DUMP DONE ========", true)
 end
 
 local function stop()
@@ -425,7 +535,7 @@ local function start()
 	end
 	running = true
 	paintRun()
-	log("START decompile pass", true)
+	log("START constants/connections dump", true)
 	task.spawn(function()
 		local ok, err = pcall(runAll)
 		if not ok then
@@ -472,15 +582,15 @@ end
 
 local function buildGui()
 	local pg = LP:FindFirstChild("PlayerGui") or LP:WaitForChild("PlayerGui")
-	local old = pg:FindFirstChild("ACDecompileUI")
+	local old = pg:FindFirstChild("ACConstDumpUI")
 	if old then
 		old:Destroy()
 	end
 
 	local gui = mk("ScreenGui", {
-		Name = "ACDecompileUI",
+		Name = "ACConstDumpUI",
 		ResetOnSpawn = false,
-		DisplayOrder = 123,
+		DisplayOrder = 124,
 		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 	}, pg)
 
@@ -511,7 +621,7 @@ local function buildGui()
 		TextSize = 14,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextColor3 = COL.text,
-		Text = "AC Probe — Decompile",
+		Text = "AC Probe — Constants Dump",
 		LayoutOrder = 1,
 	}, root)
 
@@ -553,11 +663,11 @@ local function buildGui()
 		BorderSizePixel = 0,
 		ScrollBarThickness = 4,
 		ScrollBarImageColor3 = COL.accent,
-		CanvasSize = UDim2.fromOffset(0, 2400),
+		CanvasSize = UDim2.fromOffset(0, 2200),
 	}, shell)
 
 	logBox = mk("TextLabel", {
-		Size = UDim2.new(1, -4, 0, 2400),
+		Size = UDim2.new(1, -4, 0, 2200),
 		Position = UDim2.fromOffset(2, 2),
 		BackgroundTransparency = 1,
 		Text = "",
@@ -614,8 +724,4 @@ local function buildGui()
 end
 
 buildGui()
-log("ready — decompile probe (Delta)", true)
-if not decompileFn then
-	log("WARNING: decompile missing", true)
-	setStatus("decompile missing", COL.bad)
-end
+log("ready — constants/connections (Delta)", true)
