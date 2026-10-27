@@ -398,7 +398,7 @@ local function installHook()
 	end
 	-- Solo coda: niente GUI e niente GetFullName dentro __namecall.
 	local function hook(self, ...)
-		if copying then
+		if copying or (typeof(gCaller) == "function" and gCaller()) then
 			return oldNamecall(self, ...)
 		end
 		if running then
@@ -475,7 +475,7 @@ title.Font = Enum.Font.GothamBold
 title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = COL.text
-title.Text = "   Logger v5"
+title.Text = "   Logger v6"
 title.Active = true
 title.ZIndex = 5
 title.Parent = frame
@@ -525,7 +525,7 @@ eggLbl.Font = Enum.Font.GothamBold
 eggLbl.TextSize = 12
 eggLbl.TextXAlignment = Enum.TextXAlignment.Left
 eggLbl.TextColor3 = COL.accent
-eggLbl.Text = "v5 — inventario: in attesa"
+eggLbl.Text = "v6 — inventario: in attesa"
 eggLbl.Parent = frame
 
 local scroll = Instance.new("ScrollingFrame")
@@ -1012,7 +1012,7 @@ local function scanOwnedEggs()
 	add("=== fine uova v3 ===")
 	kept = out
 	if eggLbl then
-		eggLbl.Text = "v5 — inventario: " .. tostring(eggCount)
+		eggLbl.Text = "v6 — inventario: " .. tostring(eggCount)
 	end
 	render()
 end
@@ -1027,9 +1027,9 @@ local function requestEggScan()
 		if alive and running then
 			local okScan, scanErr = pcall(scan_inventory)
 			if not okScan then
-				kept = { "=== inventario v5 ===", "SCAN ERR " .. tostring(scanErr) }
+				kept = { "=== inventario v6 ===", "SCAN ERR " .. tostring(scanErr) }
 				if eggLbl then
-					eggLbl.Text = "v5 — scan errore"
+					eggLbl.Text = "v6 — scan errore"
 				end
 				render()
 			end
@@ -1040,7 +1040,7 @@ end
 scan_inventory = function()
 	ownedByUid = {}
 	ownedByName = {}
-	local out = { "=== inventario v5 ===" }
+	local out = { "=== inventario v6 ===" }
 	local n = 0
 
 	local function addItem(inst, where)
@@ -1161,10 +1161,10 @@ scan_inventory = function()
 	if n == 0 then
 		out[#out + 1] = "nessun Tool in Backpack/Character"
 	end
-	out[#out + 1] = "=== fine inventario v5 (" .. tostring(n) .. ") ==="
+	out[#out + 1] = "=== fine inventario v6 (" .. tostring(n) .. ") ==="
 	kept = out
 	if eggLbl then
-		eggLbl.Text = "v5 — inventario: " .. tostring(n)
+		eggLbl.Text = "v6 — inventario: " .. tostring(n)
 	end
 	for i = 1, #out do
 		print(out[i])
@@ -1211,13 +1211,13 @@ startBtn.Activated:Connect(function()
 	anyHits = 0
 	fireHits = 0
 	setRunning(true)
-	push("[OK] v5 in ascolto. Solo uova/pet dell'inventario.")
+	push("[OK] v6 in ascolto. Solo uova/pet dell'inventario.")
 	push("START legge lo zaino. Poi vendi e premi COPIA.")
 	local okScan, scanErr = pcall(scan_inventory)
 	if not okScan then
-		kept = { "=== inventario v5 ===", "SCAN ERR " .. tostring(scanErr) }
+		kept = { "=== inventario v6 ===", "SCAN ERR " .. tostring(scanErr) }
 		if eggLbl then
-			eggLbl.Text = "v5 — scan errore"
+			eggLbl.Text = "v6 — scan errore"
 		end
 		render()
 	end
@@ -1254,7 +1254,65 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
+local CLIP_MARK = "delta_logger_v6"
+local CLIP_FILE = "delta_logger_v6.txt"
 local lastCopy = 0
+
+local function readClip()
+	if typeof(gGetClip) == "function" then
+		local ok, v = pcall(gGetClip)
+		if ok and type(v) == "string" then
+			return v
+		end
+	end
+	local fn = bare("getclipboard") or bare("get_clipboard")
+	if typeof(fn) == "function" then
+		local ok, v = pcall(fn)
+		if ok and type(v) == "string" then
+			return v
+		end
+	end
+	return nil
+end
+
+local function clipLanded(got)
+	return type(got) == "string" and string.find(got, CLIP_MARK, 1, true) ~= nil
+end
+
+local function saveLog(text)
+	local function attempt(fn)
+		if typeof(fn) ~= "function" then
+			return false
+		end
+		local ok = pcall(fn, CLIP_FILE, text)
+		return ok
+	end
+	if attempt(writefile) then
+		return true
+	end
+	return attempt(bare("writefile"))
+end
+
+local function pushClip(fn, text)
+	if typeof(fn) ~= "function" then
+		return false, "assente"
+	end
+	local ok, err = pcall(function()
+		fn(text)
+	end)
+	if not ok then
+		return false, tostring(err)
+	end
+	local got = readClip()
+	if got == nil then
+		return true, "no-verify"
+	end
+	if clipLanded(got) then
+		return true, "verify"
+	end
+	return false, "invariati"
+end
+
 local function doCopy()
 	if not alive then
 		return
@@ -1265,77 +1323,72 @@ local function doCopy()
 	end
 	lastCopy = now
 	copyBtn.Text = "..."
+	if eggLbl then
+		eggLbl.Text = "v6 — copio..."
+	end
 	setStatus("copio...", 8)
+	local raw = string.gsub(fullText(), "%z", "")
+	raw = string.gsub(raw, "[%c]", function(ch)
+		if ch == "\n" or ch == "\t" or ch == "\r" then
+			return ch
+		end
+		return " "
+	end)
+	if raw == "" then
+		copyBtn.Text = "ERRORE"
+		if eggLbl then
+			eggLbl.Text = "v6 — niente da copiare"
+		end
+		setStatus("niente da copiare", 8)
+		task.delay(1.5, function()
+			if alive then
+				copyBtn.Text = "COPIA"
+			end
+		end)
+		return
+	end
+	local full = CLIP_MARK .. "\n" .. raw
 	local wasRunning = running
 	copying = true
 	removeHook()
-	local text = string.gsub(fullText(), "%z", "")
-	local wrote = false
-	local why = "setclipboard assente"
-	local got = nil
-	if text == "" then
-		why = "niente da copiare"
-	else
-		local loader = loadstring or load
-		if typeof(loader) == "function" then
-			local chunk = loader([[
-				local text = ...
-				local function apply(fn)
-					if typeof(fn) ~= "function" then
-						return false
-					end
-					fn(text)
-					return true
-				end
-				local used = apply(setclipboard) or apply(toclipboard) or apply(setrbxclipboard)
-				if not used and typeof(clipboard) == "table" then
-					used = apply(clipboard.set)
-				end
-				local read = nil
-				if typeof(getclipboard) == "function" then
-					read = getclipboard()
-				elseif typeof(get_clipboard) == "function" then
-					read = get_clipboard()
-				end
-				return used, read
-			]])
-			if typeof(chunk) == "function" then
-				local ok, used, read = pcall(chunk, text)
-				if ok and used == true then
-					wrote = true
-					got = read
-				elseif not ok then
-					why = tostring(used)
+	local saved = saveLog(full)
+	local function attempt(text)
+		local ok, why = pushClip(gClip, text)
+		if ok then
+			return true, why
+		end
+		ok, why = pushClip(gClip2, text)
+		if ok then
+			return true, why
+		end
+		ok, why = pushClip(bare("setclipboard"), text)
+		if ok then
+			return true, why
+		end
+		ok, why = pushClip(bare("toclipboard"), text)
+		if ok then
+			return true, why
+		end
+		return pushClip(bare("setrbxclipboard"), text)
+	end
+	local wrote, why = attempt(full)
+	local copied = full
+	if not wrote then
+		local caps = { 12000, 4000, 1500, 400 }
+		for i = 1, #caps do
+			if #full > caps[i] then
+				local short = string.sub(full, 1, caps[i]) .. "\n…(troncato)"
+				wrote, why = attempt(short)
+				if wrote then
+					copied = short
+					break
 				end
 			end
 		end
-		if not wrote and typeof(gClip) == "function" then
-			local ok, err = pcall(gClip, text)
-			wrote = ok
-			if not ok then
-				why = tostring(err)
-			end
-		end
-		if not wrote and typeof(gClip2) == "function" then
-			local ok, err = pcall(gClip2, text)
-			wrote = ok
-			if not ok then
-				why = tostring(err)
-			end
-		end
-		if wrote and typeof(gGetClip) == "function" and type(got) ~= "string" then
-			local ok, read = pcall(gGetClip)
-			if ok then
-				got = read
-			end
-		end
-		if type(got) == "string" then
-			local sample = string.sub(text, 1, math.min(40, #text))
-			if sample ~= "" and string.find(got, sample, 1, true) == nil then
-				wrote = false
-				why = "appunti invariati"
-			end
-		end
+	end
+	if not wrote then
+		wrote, why = attempt(CLIP_MARK .. "\nCOPIA file " .. CLIP_FILE)
+		copied = CLIP_MARK
 	end
 	copying = false
 	if wasRunning then
@@ -1344,15 +1397,40 @@ local function doCopy()
 		startBtn.Text = "STOP"
 		startBtn.BackgroundColor3 = COL.on
 	end
-	if wrote then
+	if wrote and copied == full then
 		copyBtn.Text = "OK"
-		setStatus("COPIA OK " .. tostring(#text) .. " chars", 8)
-		print("[DeltaLogger] COPIA OK " .. tostring(#text))
+		local note = "COPIA OK " .. tostring(#full) .. " chars"
+		if saved then
+			note = note .. " + file"
+		end
+		if eggLbl then
+			eggLbl.Text = "v6 — " .. note
+		end
+		setStatus(note, 8)
+		print("[DeltaLogger] " .. note)
+	elseif wrote then
+		copyBtn.Text = "OK"
+		local note = "COPIA " .. tostring(#copied) .. " chars"
+		if saved then
+			note = note .. " | intero in " .. CLIP_FILE
+		end
+		if eggLbl then
+			eggLbl.Text = "v6 — " .. note
+		end
+		setStatus(note, 8)
+		print("[DeltaLogger] " .. note)
 	else
 		copyBtn.Text = "ERRORE"
-		setStatus("COPIA " .. why, 8)
-		push("[ERR] COPIA " .. why)
-		print("[DeltaLogger] COPIA FAIL " .. why)
+		local note = "COPIA " .. tostring(why)
+		if saved then
+			note = note .. " | file " .. CLIP_FILE
+		end
+		if eggLbl then
+			eggLbl.Text = "v6 — " .. note
+		end
+		setStatus(note, 8)
+		push("[ERR] " .. note)
+		print("[DeltaLogger] " .. note)
 	end
 	task.delay(1.5, function()
 		if alive then
