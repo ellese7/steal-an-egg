@@ -11,6 +11,7 @@
 
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 
 local LP = Players.LocalPlayer
 
@@ -77,9 +78,13 @@ local COL = {
 
 local alive = true
 local running = false
-local busy = false
 local oldNamecall
 local hooked = false
+local queue = {}
+local anyHits = 0
+local fireHits = 0
+local methodSeen = {}
+local methodList = {}
 local lines = {}
 local pinned = {}
 local seen = {}
@@ -221,18 +226,21 @@ local function isNoise(path)
 end
 
 local function note(method, self, ...)
-	if typeof(self) ~= "Instance" then
-		return
+	local name = "?"
+	local path = "?"
+	if typeof(self) == "Instance" then
+		name = tostring(self.Name)
+		path = name
+		local class = self.ClassName
+		if class == "RemoteEvent" or class == "RemoteFunction" then
+			local ok, full = pcall(function()
+				return self:GetFullName()
+			end)
+			if ok and type(full) == "string" then
+				path = full
+			end
+		end
 	end
-	local class = self.ClassName
-	if class ~= "RemoteEvent" and class ~= "RemoteFunction" then
-		return
-	end
-	local name = self.Name
-	local path = name
-	pcall(function()
-		path = self:GetFullName()
-	end)
 	local args = argsText(...)
 	local key = method .. "\0" .. path .. "\0" .. args
 	local now = os.clock()
@@ -256,22 +264,50 @@ local function note(method, self, ...)
 	end
 end
 
+local function rememberMethod(method)
+	local label
+	if typeof(method) == "string" then
+		label = method
+	else
+		label = typeof(method) .. ":" .. tostring(method)
+	end
+	if methodSeen[label] or #methodList >= 18 then
+		return
+	end
+	methodSeen[label] = true
+	methodList[#methodList + 1] = label
+end
+
+local function enqueue(method, self, ...)
+	fireHits = fireHits + 1
+	if #queue >= 80 then
+		table.remove(queue, 1)
+	end
+	local packed = table.pack(...)
+	packed.method = method
+	packed.inst = self
+	queue[#queue + 1] = packed
+end
+
 local function installHook()
 	if hooked then
 		return true
 	end
-	if typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" then
+	if typeof(hookmetamethod) ~= "function" or typeof(gNamecall) ~= "function" then
 		push("[ERR] Delta: hookmetamethod o getnamecallmethod assente")
 		return false
 	end
+	-- Solo coda: niente GUI e niente GetFullName dentro __namecall.
 	local function hook(self, ...)
-		local method = getnamecallmethod()
-		method = type(method) == "string" and method or ""
-		if running and not busy and METHODS[method] then
-			if not checkcaller or not checkcaller() then
-				busy = true
-				pcall(note, method, self, ...)
-				busy = false
+		if running then
+			anyHits = anyHits + 1
+			local method = gNamecall()
+			rememberMethod(method)
+			if typeof(method) == "string" then
+				local lowm = string.lower(method)
+				if lowm == "fireserver" or lowm == "invokeserver" then
+					enqueue(method, self, ...)
+				end
 			end
 		end
 		return oldNamecall(self, ...)
@@ -464,15 +500,47 @@ startBtn.MouseButton1Click:Connect(function()
 	lines = {}
 	pinned = {}
 	seen = {}
+	queue = {}
+	methodSeen = {}
+	methodList = {}
 	shown = 0
 	skipped = 0
+	anyHits = 0
+	fireHits = 0
 	setRunning(true)
 	push("[OK] ascolto ogni FireServer/InvokeServer")
-	push("doppioni saltati — VENDITA resta in cima")
+	push("se namecall resta 0, l'hook non vede le chiamate")
+end)
+
+RunService.Heartbeat:Connect(function()
+	if not alive then
+		return
+	end
+	if running then
+		setStatus(string.format("namecall %d — fire %d — in log %d", anyHits, fireHits, shown))
+	end
+	local budget = 6
+	while budget > 0 and #queue > 0 do
+		budget = budget - 1
+		local item = table.remove(queue, 1)
+		local ok, err = pcall(function()
+			note(item.method, item.inst, table.unpack(item, 1, item.n))
+		end)
+		if not ok then
+			push("[ERR] " .. tostring(err))
+		end
+	end
+	if running and #methodList > 0 and anyHits >= 30 and not methodSeen.__dumped then
+		methodSeen.__dumped = true
+		push("metodi visti: " .. table.concat(methodList, ", "))
+	end
 end)
 
 copyBtn.MouseButton1Click:Connect(function()
-	local text = logLabel and logLabel.Text or fullText()
+	local text = fullText()
+	if text == "" and logLabel then
+		text = logLabel.Text
+	end
 	if text == "" then
 		setStatus("niente da copiare")
 		return
