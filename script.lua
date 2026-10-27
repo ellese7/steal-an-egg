@@ -74,6 +74,7 @@ local COL = {
 	idle = Color3.fromRGB(55, 62, 74),
 	on = Color3.fromRGB(36, 140, 88),
 	copy = Color3.fromRGB(40, 75, 130),
+	accent = Color3.fromRGB(120, 210, 255),
 }
 
 local alive = true
@@ -376,6 +377,8 @@ title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = COL.text
 title.Text = "   Logger v3"
+title.Active = true
+title.ZIndex = 5
 title.Parent = frame
 local titleCorner = Instance.new("UICorner")
 titleCorner.CornerRadius = UDim.new(0, 10)
@@ -392,6 +395,8 @@ local function makeBtn(text, color, x)
 	b.TextColor3 = COL.text
 	b.Text = text
 	b.AutoButtonColor = true
+	b.Active = true
+	b.ZIndex = 5
 	b.Parent = frame
 	local c = Instance.new("UICorner")
 	c.CornerRadius = UDim.new(0, 8)
@@ -944,7 +949,7 @@ local function setRunning(on)
 	end
 end
 
-startBtn.MouseButton1Click:Connect(function()
+startBtn.Activated:Connect(function()
 	if not alive then
 		return
 	end
@@ -1014,7 +1019,7 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
-copyBtn.MouseButton1Click:Connect(function()
+copyBtn.Activated:Connect(function()
 	local text = fullText()
 	if text == "" and logLabel then
 		text = logLabel.Text
