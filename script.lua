@@ -87,6 +87,7 @@ local methodSeen = {}
 local methodList = {}
 local lines = {}
 local pinned = {}
+local kept = {}
 local seen = {}
 local shown = 0
 local skipped = 0
@@ -175,6 +176,9 @@ local function fullText()
 	local chunks = {}
 	if #pinned > 0 then
 		chunks[#chunks + 1] = table.concat(pinned, "\n")
+	end
+	if #kept > 0 then
+		chunks[#chunks + 1] = table.concat(kept, "\n")
 	end
 	if #lines > 0 then
 		chunks[#chunks + 1] = table.concat(lines, "\n")
@@ -470,6 +474,304 @@ UIS.InputChanged:Connect(function(input)
 	)
 end)
 
+local RARITY_WORDS = { "eternal", "divine", "secret", "cosmic", "mythic", "legendary", "epic", "rare", "uncommon", "common" }
+local eggConn
+local scanQueued = false
+
+local function isUid(s)
+	if typeof(s) ~= "string" then
+		return false
+	end
+	local hex = string.gsub(s, "-", "")
+	return #hex >= 16 and #hex <= 40 and string.match(hex, "^%x+$") ~= nil
+end
+
+local function relPath(root, inst)
+	local parts = {}
+	local n = inst
+	local guard = 0
+	while n and n ~= root and guard < 8 do
+		table.insert(parts, 1, n.Name)
+		n = n.Parent
+		guard = guard + 1
+	end
+	return table.concat(parts, ".")
+end
+
+local function parseKg(s)
+	if typeof(s) ~= "string" then
+		return nil
+	end
+	local t = string.gsub(string.lower(s), ",", ".")
+	local n = string.match(t, "([%d%.]+)%s*kg")
+	if n then
+		return tonumber(n)
+	end
+	return nil
+end
+
+local function rarityIn(s)
+	if s == nil then
+		return nil
+	end
+	local t = string.lower(tostring(s))
+	for i = 1, #RARITY_WORDS do
+		if string.find(t, RARITY_WORDS[i], 1, true) then
+			return RARITY_WORDS[i]
+		end
+	end
+	return nil
+end
+
+local function scanOwnedEggs()
+	local out = {}
+	local function add(line)
+		out[#out + 1] = line
+	end
+	add("=== uova in possesso ===")
+
+	local pg = LP:FindFirstChild("PlayerGui")
+	local cards = {}
+	if pg then
+		local ok, desc = pcall(function()
+			return pg:GetDescendants()
+		end)
+		if ok and desc then
+			for i = 1, #desc do
+				local d = desc[i]
+				if isUid(d.Name) then
+					local path = ""
+					pcall(function()
+						path = d:GetFullName()
+					end)
+					local lowp = string.lower(path)
+					if string.find(lowp, "sell", 1, true)
+						or string.find(lowp, "egg", 1, true)
+						or string.find(lowp, "satchel", 1, true)
+						or string.find(lowp, "invent", 1, true)
+						or string.find(lowp, "card", 1, true)
+					then
+						cards[#cards + 1] = d
+						if #cards >= 30 then
+							break
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if #cards == 0 then
+		add("GUI: nessuna carta. Apri Vendi: l'id e' il nome di VisibleCards.<uid>")
+	end
+
+	for i = 1, #cards do
+		local card = cards[i]
+		local uid = card.Name
+		local path = uid
+		pcall(function()
+			path = card:GetFullName()
+		end)
+		local labels = {}
+		local nome, nomeDa
+		local rar, rarDa
+		local peso, pesoDa
+		local function take(from, key, value)
+			local r = rarityIn(value) or rarityIn(key)
+			if r and not rar then
+				rar = r
+				rarDa = from
+			end
+			local kg = parseKg(tostring(value))
+			if not kg and (string.find(string.lower(key), "weight", 1, true) or string.find(string.lower(key), "mass", 1, true) or string.find(string.lower(key), "kg", 1, true)) then
+				kg = tonumber(tostring(value):gsub(",", "."))
+			end
+			if kg and not peso then
+				peso = kg
+				pesoDa = from
+			end
+			local lk = string.lower(key)
+			if not nome and (lk == "title" or lk == "name" or lk == "eggname" or lk == "displayname" or lk == "petname") then
+				if typeof(value) == "string" and value ~= "" and not parseKg(value) and not rarityIn(value) then
+					nome = value
+					nomeDa = from
+				end
+			end
+		end
+		local okAttr, attrs = pcall(function()
+			return card:GetAttributes()
+		end)
+		if okAttr and attrs then
+			for k, v in pairs(attrs) do
+				take("attr " .. tostring(k), tostring(k), v)
+			end
+		end
+		for _, d in ipairs(card:GetDescendants()) do
+			if d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then
+				local text = d.Text
+				if typeof(text) == "string" and text ~= "" then
+					local where = relPath(card, d) .. ".Text"
+					labels[#labels + 1] = d.Name .. "=" .. string.format("%q", string.sub(text, 1, 60))
+					take(where, d.Name, text)
+				end
+			end
+			local okA, a = pcall(function()
+				return d:GetAttributes()
+			end)
+			if okA and a then
+				for k, v in pairs(a) do
+					take(relPath(card, d) .. ".attr." .. tostring(k), tostring(k), v)
+				end
+			end
+		end
+		if not nome then
+			for _, d in ipairs(card:GetDescendants()) do
+				if d:IsA("TextLabel") then
+					local text = d.Text
+					if typeof(text) == "string" and #text > 1 and not parseKg(text) and not rarityIn(text) and string.lower(text) ~= "sell" then
+						nome = text
+						nomeDa = relPath(card, d) .. ".Text"
+						break
+					end
+				end
+			end
+		end
+		add(string.format(
+			"UOVO %s | nome=%s | rarita=%s | peso=%s kg",
+			uid,
+			nome or "?",
+			rar or "?",
+			peso and string.format("%.3f", peso) or "?"
+		))
+		add("  dove: " .. path)
+		add("  nome letto da: " .. (nomeDa or "?"))
+		add("  rarita letta da: " .. (rarDa or "?"))
+		add("  peso letto da: " .. (pesoDa or "?"))
+		if #labels > 0 then
+			local shownL = {}
+			for L = 1, math.min(#labels, 8) do
+				shownL[L] = labels[L]
+			end
+			add("  etichette: " .. table.concat(shownL, " | "))
+		end
+	end
+
+	local gcFn = getgc
+	local gcCount = 0
+	if typeof(gcFn) == "function" then
+		local ok, heap = pcall(function()
+			return gcFn(true)
+		end)
+		if ok and typeof(heap) == "table" then
+			for i = 1, #heap do
+				local obj = heap[i]
+				if type(obj) == "table" then
+					local uid = obj.EggUid or obj.Uid or obj.UID
+					if typeof(uid) ~= "string" then
+						uid = nil
+					end
+					local nome = obj.EggName or obj.DisplayName or obj.Name
+					local rar = obj.Rarity or obj.RarityId or obj.RarityName
+					local peso = obj.Weight or obj.Kg or obj.Mass
+					local looksEgg = uid and (obj.EggUid or obj.EggName or rar or (type(nome) == "string" and string.find(string.lower(nome), "egg", 1, true)))
+					if looksEgg and gcCount < 25 then
+						gcCount = gcCount + 1
+						local kg = tonumber(peso)
+						if not kg and typeof(peso) == "string" then
+							kg = parseKg(peso) or tonumber((peso:gsub(",", ".")))
+						end
+						add(string.format(
+							"DATO uid=%s | nome=%s | rarita=%s | peso=%s kg",
+							tostring(uid),
+							typeof(nome) == "string" and nome or "?",
+							rar and tostring(rar) or "?",
+							kg and string.format("%.3f", kg) or "?"
+						))
+						add("  dove: tabella con chiavi EggUid/Uid, EggName/DisplayName, Rarity/RarityId, Weight (kg)")
+					end
+				end
+			end
+		else
+			add("getgc non ha restituito tabelle")
+		end
+	else
+		add("getgc assente: gli id GUI stanno nel nome di VisibleCards.<uid>")
+	end
+	if gcCount == 0 then
+		add("nessuna tabella uovo (EggUid + rarita/peso) nel getgc")
+	end
+
+	local bp = LP:FindFirstChild("Backpack")
+	local toolN = 0
+	local function scanTools(folder)
+		if not folder then
+			return
+		end
+		for _, tool in ipairs(folder:GetChildren()) do
+			if tool:IsA("Tool") and toolN < 15 then
+				local blob = string.lower(tool.Name)
+				local okA, attrs = pcall(function()
+					return tool:GetAttributes()
+				end)
+				local uid, nome, rar, peso
+				if okA and attrs then
+					for k, v in pairs(attrs) do
+						blob = blob .. " " .. string.lower(tostring(k)) .. " " .. string.lower(tostring(v))
+						if (k == "UID" or k == "EggUid" or k == "Uid") and typeof(v) == "string" then
+							uid = v
+						end
+						if k == "DisplayName" or k == "EggName" then
+							nome = tostring(v)
+						end
+						if not rar then
+							rar = rarityIn(k) or rarityIn(v)
+						end
+						if k == "Weight" or k == "Mass" or k == "Kg" then
+							peso = tonumber(v) or parseKg(tostring(v))
+						end
+					end
+				end
+				if string.find(blob, "egg", 1, true) or string.find(blob, "uovo", 1, true) then
+					toolN = toolN + 1
+					local tpath = tool.Name
+					pcall(function()
+						tpath = tool:GetFullName()
+					end)
+					add(string.format(
+						"TOOL uid=%s | nome=%s | rarita=%s | peso=%s kg",
+						uid or "?",
+						nome or tool.Name,
+						rar or "?",
+						peso and string.format("%.3f", peso) or "?"
+					))
+					add("  dove: " .. tpath .. " attributi UID, DisplayName, Weight")
+				end
+			end
+		end
+	end
+	scanTools(bp)
+	scanTools(LP.Character)
+	if toolN == 0 then
+		add("zaino: nessun Tool con 'egg' nel nome o negli attributi")
+	end
+	add("=== fine uova ===")
+	kept = out
+	render()
+end
+
+local function requestEggScan()
+	if scanQueued or not running then
+		return
+	end
+	scanQueued = true
+	task.delay(0.5, function()
+		scanQueued = false
+		if alive and running then
+			scanOwnedEggs()
+		end
+	end)
+end
+
 local function setRunning(on)
 	running = on
 	if on then
@@ -499,6 +801,7 @@ startBtn.MouseButton1Click:Connect(function()
 	end
 	lines = {}
 	pinned = {}
+	kept = {}
 	seen = {}
 	queue = {}
 	methodSeen = {}
@@ -510,6 +813,15 @@ startBtn.MouseButton1Click:Connect(function()
 	setRunning(true)
 	push("[OK] ascolto ogni FireServer/InvokeServer")
 	push("se namecall resta 0, l'hook non vede le chiamate")
+	scanOwnedEggs()
+	local pg = LP:FindFirstChild("PlayerGui")
+	if pg and not eggConn then
+		eggConn = pg.DescendantAdded:Connect(function(d)
+			if running and isUid(d.Name) then
+				requestEggScan()
+			end
+		end)
+	end
 end)
 
 RunService.Heartbeat:Connect(function()
@@ -563,6 +875,12 @@ ENV.__DeltaLoggerKill = function()
 	alive = false
 	running = false
 	removeHook()
+	if eggConn then
+		pcall(function()
+			eggConn:Disconnect()
+		end)
+		eggConn = nil
+	end
 	pcall(function()
 		screen:Destroy()
 	end)
