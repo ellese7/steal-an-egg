@@ -398,7 +398,7 @@ local function installHook()
 	end
 	-- Solo coda: niente GUI e niente GetFullName dentro __namecall.
 	local function hook(self, ...)
-		if copying or (typeof(checkcaller) == "function" and checkcaller()) then
+		if copying then
 			return oldNamecall(self, ...)
 		end
 		if running then
@@ -1254,92 +1254,116 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
-local function clipboardText()
-	local text = fullText()
-	if text == "" and logLabel then
-		local plain = logLabel.ContentText
-		if type(plain) ~= "string" or plain == "" then
-			plain = logLabel.Text
-		end
-		text = plain or ""
-	end
-	text = string.gsub(text, "%z", "")
-	text = string.gsub(text, "<font[^>]*>", "")
-	text = string.gsub(text, "</font>", "")
-	text = string.gsub(text, "&lt;", "<")
-	text = string.gsub(text, "&gt;", ">")
-	text = string.gsub(text, "&amp;", "&")
-	return text
-end
-
-local function tryClip(fn, text)
-	if typeof(fn) ~= "function" then
-		return false, "assente"
-	end
-	local ok, err = pcall(function()
-		fn(text)
-	end)
-	if not ok then
-		return false, err
-	end
-	if typeof(gGetClip) == "function" then
-		local rok, got = pcall(gGetClip)
-		if rok and type(got) == "string" and #got > 0 then
-			return true
-		end
-	end
-	return true
-end
-
+local lastCopy = 0
 local function doCopy()
-	if not alive or copying then
+	if not alive then
 		return
 	end
+	local now = os.clock()
+	if now - lastCopy < 0.4 then
+		return
+	end
+	lastCopy = now
+	copyBtn.Text = "..."
+	setStatus("copio...", 8)
+	local wasRunning = running
 	copying = true
-	local text = clipboardText()
+	removeHook()
+	local text = string.gsub(fullText(), "%z", "")
+	local wrote = false
+	local why = "setclipboard assente"
+	local got = nil
 	if text == "" then
-		copying = false
-		setStatus("niente da copiare", 4)
-		return
-	end
-	local ok, err = tryClip(gClip, text)
-	if not ok then
-		ok, err = tryClip(setclipboard, text)
-	end
-	if not ok then
-		ok, err = tryClip(gClip2, text)
-	end
-	if not ok then
-		ok, err = tryClip(bare("setclipboard"), text)
-	end
-	if not ok then
-		ok, err = tryClip(bare("toclipboard"), text)
-	end
-	if not ok then
-		ok, err = tryClip(bare("setrbxclipboard"), text)
-	end
-	if not ok and typeof(getgenv) == "function" then
-		local genv = getgenv()
-		if type(genv) == "table" then
-			ok, err = tryClip(genv.setclipboard, text)
-			if not ok and type(genv.clipboard) == "table" then
-				ok, err = tryClip(genv.clipboard.set, text)
+		why = "niente da copiare"
+	else
+		local loader = loadstring or load
+		if typeof(loader) == "function" then
+			local chunk = loader([[
+				local text = ...
+				local function apply(fn)
+					if typeof(fn) ~= "function" then
+						return false
+					end
+					fn(text)
+					return true
+				end
+				local used = apply(setclipboard) or apply(toclipboard) or apply(setrbxclipboard)
+				if not used and typeof(clipboard) == "table" then
+					used = apply(clipboard.set)
+				end
+				local read = nil
+				if typeof(getclipboard) == "function" then
+					read = getclipboard()
+				elseif typeof(get_clipboard) == "function" then
+					read = get_clipboard()
+				end
+				return used, read
+			]])
+			if typeof(chunk) == "function" then
+				local ok, used, read = pcall(chunk, text)
+				if ok and used == true then
+					wrote = true
+					got = read
+				elseif not ok then
+					why = tostring(used)
+				end
+			end
+		end
+		if not wrote and typeof(gClip) == "function" then
+			local ok, err = pcall(gClip, text)
+			wrote = ok
+			if not ok then
+				why = tostring(err)
+			end
+		end
+		if not wrote and typeof(gClip2) == "function" then
+			local ok, err = pcall(gClip2, text)
+			wrote = ok
+			if not ok then
+				why = tostring(err)
+			end
+		end
+		if wrote and typeof(gGetClip) == "function" and type(got) ~= "string" then
+			local ok, read = pcall(gGetClip)
+			if ok then
+				got = read
+			end
+		end
+		if type(got) == "string" then
+			local sample = string.sub(text, 1, math.min(40, #text))
+			if sample ~= "" and string.find(got, sample, 1, true) == nil then
+				wrote = false
+				why = "appunti invariati"
 			end
 		end
 	end
 	copying = false
-	if ok then
-		setStatus("COPIA OK " .. tostring(#text) .. " chars", 6)
+	if wasRunning then
+		installHook()
+		running = true
+		startBtn.Text = "STOP"
+		startBtn.BackgroundColor3 = COL.on
+	end
+	if wrote then
+		copyBtn.Text = "OK"
+		setStatus("COPIA OK " .. tostring(#text) .. " chars", 8)
 		print("[DeltaLogger] COPIA OK " .. tostring(#text))
 	else
-		setStatus("COPIA fallita", 6)
-		push("[ERR] COPIA " .. tostring(err))
-		print("[DeltaLogger] COPIA FAIL " .. tostring(err))
+		copyBtn.Text = "ERRORE"
+		setStatus("COPIA " .. why, 8)
+		push("[ERR] COPIA " .. why)
+		print("[DeltaLogger] COPIA FAIL " .. why)
 	end
+	task.delay(1.5, function()
+		if alive then
+			copyBtn.Text = "COPIA"
+		end
+	end)
 end
 
 copyBtn.MouseButton1Click:Connect(doCopy)
 copyBtn.Activated:Connect(doCopy)
+copyBtn.MouseButton1Down:Connect(doCopy)
 
 ENV.__DeltaLoggerKill = function()
 	alive = false
