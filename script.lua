@@ -22,6 +22,7 @@ local gClosure = newcclosure
 local gCaller = checkcaller
 local gClip = setclipboard
 local gClip2 = toclipboard
+local gGetClip = getclipboard
 local gHui = gethui
 
 local function bare(name)
@@ -79,6 +80,8 @@ local COL = {
 
 local alive = true
 local running = false
+local copying = false
+local statusHold = 0
 local oldNamecall
 local hooked = false
 local queue = {}
@@ -190,6 +193,10 @@ local function fullText()
 	return table.concat(chunks, "\n")
 end
 
+local function richEsc(s)
+	return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
 local function render()
 	if not logLabel then
 		return
@@ -197,41 +204,47 @@ local function render()
 	while #fullText() > MAX_CHARS and #lines > 1 do
 		table.remove(lines, 1)
 	end
-	local text = fullText()
-	if #text > MAX_CHARS then
-		text = string.sub(text, #text - MAX_CHARS + 1)
+	local raw = fullText()
+	if #raw > MAX_CHARS then
+		raw = string.sub(raw, #raw - MAX_CHARS + 1)
 	end
-	logLabel.Text = text
-end
-
-local function richEsc(s)
-	return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+	local pieces = {}
+	for line in string.gmatch(raw .. "\n", "([^\n]*)\n") do
+		local esc = richEsc(line)
+		if string.find(line, "[INVENTARIO]", 1, true) or string.sub(line, 1, 7) == "  attr " or string.sub(line, 1, 11) == "  istanza:" then
+			esc = '<font color="rgb(80,220,140)">' .. esc .. "</font>"
+		end
+		pieces[#pieces + 1] = esc
+	end
+	local okSet = pcall(function()
+		logLabel.RichText = true
+		logLabel.Text = table.concat(pieces, "\n")
+	end)
+	if not okSet then
+		logLabel.RichText = false
+		logLabel.Text = raw
+	end
 end
 
 local function push(line)
-	line = tostring(line)
-	if string.sub(line, 1, 5) ~= "<font" then
-		line = richEsc(line)
-	end
-	lines[#lines + 1] = line
+	lines[#lines + 1] = tostring(line)
 	render()
 end
 
 local function pushPin(line)
-	line = tostring(line)
-	if string.sub(line, 1, 5) ~= "<font" then
-		line = richEsc(line)
-	end
-	pinned[#pinned + 1] = line
+	pinned[#pinned + 1] = tostring(line)
 	while #pinned > 24 do
 		table.remove(pinned, 1)
 	end
 	render()
 end
 
-local function setStatus(s)
+local function setStatus(s, hold)
 	if statusLbl then
 		statusLbl.Text = s
+	end
+	if hold then
+		statusHold = os.clock() + hold
 	end
 end
 
@@ -344,7 +357,7 @@ local function note(method, self, ...)
 			body = body .. "\n" .. extra
 		end
 	end
-	pushPin('<font color="rgb(80,220,140)">' .. richEsc(body) .. "</font>")
+	pushPin(body)
 	if running then
 		setStatus("in ascolto — inventario " .. tostring(shown))
 	end
@@ -385,6 +398,9 @@ local function installHook()
 	end
 	-- Solo coda: niente GUI e niente GetFullName dentro __namecall.
 	local function hook(self, ...)
+		if copying or (typeof(checkcaller) == "function" and checkcaller()) then
+			return oldNamecall(self, ...)
+		end
 		if running then
 			anyHits = anyHits + 1
 			local method = gNamecall()
@@ -479,7 +495,7 @@ local function makeBtn(text, color, x, y, w)
 	b.Text = text
 	b.AutoButtonColor = true
 	b.Active = true
-	b.ZIndex = 5
+	b.ZIndex = 10
 	b.Parent = frame
 	local c = Instance.new("UICorner")
 	c.CornerRadius = UDim.new(0, 8)
@@ -489,11 +505,10 @@ end
 
 startBtn = makeBtn("START", COL.idle, 14, 40, 148)
 local copyBtn = makeBtn("COPIA", COL.copy, 176, 40, 148)
-local dumpBtn = makeBtn("DUMP INVENTORY", COL.accent, 14, 78, 312)
 
 statusLbl = Instance.new("TextLabel")
 statusLbl.Size = UDim2.new(1, -24, 0, 18)
-statusLbl.Position = UDim2.fromOffset(14, 116)
+statusLbl.Position = UDim2.fromOffset(14, 78)
 statusLbl.BackgroundTransparency = 1
 statusLbl.Font = Enum.Font.Gotham
 statusLbl.TextSize = 12
@@ -504,7 +519,7 @@ statusLbl.Parent = frame
 
 eggLbl = Instance.new("TextLabel")
 eggLbl.Size = UDim2.new(1, -24, 0, 16)
-eggLbl.Position = UDim2.fromOffset(14, 136)
+eggLbl.Position = UDim2.fromOffset(14, 98)
 eggLbl.BackgroundTransparency = 1
 eggLbl.Font = Enum.Font.GothamBold
 eggLbl.TextSize = 12
@@ -515,8 +530,8 @@ eggLbl.Parent = frame
 
 local scroll = Instance.new("ScrollingFrame")
 scroll.Name = "Log"
-scroll.Size = UDim2.new(1, -20, 1, -168)
-scroll.Position = UDim2.fromOffset(10, 156)
+scroll.Size = UDim2.new(1, -20, 1, -130)
+scroll.Position = UDim2.fromOffset(10, 118)
 scroll.BackgroundColor3 = Color3.fromRGB(8, 10, 14)
 scroll.BorderSizePixel = 0
 scroll.ScrollBarThickness = 4
@@ -1197,7 +1212,7 @@ startBtn.Activated:Connect(function()
 	fireHits = 0
 	setRunning(true)
 	push("[OK] v4 in ascolto. Solo uova/pet dell'inventario.")
-	push("DUMP INVENTORY aggiorna gli uid prima di vendere.")
+	push("START legge lo zaino. Poi vendi e premi COPIA.")
 	local okScan, scanErr = pcall(scan_inventory)
 	if not okScan then
 		kept = { "=== inventario v4 ===", "SCAN ERR " .. tostring(scanErr) }
@@ -1220,7 +1235,7 @@ RunService.Heartbeat:Connect(function()
 	if not alive then
 		return
 	end
-	if running then
+	if running and os.clock() >= statusHold then
 		setStatus(string.format("namecall %d — fire %d — in log %d", anyHits, fireHits, shown))
 	end
 	local budget = 6
@@ -1239,42 +1254,92 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
-dumpBtn.Activated:Connect(function()
-	if not alive then
-		return
-	end
-	local okScan, scanErr = pcall(scan_inventory)
-	if not okScan then
-		kept = { "=== inventario v4 ===", "SCAN ERR " .. tostring(scanErr) }
-		if eggLbl then
-			eggLbl.Text = "v4 — scan errore"
-		end
-		render()
-	end
-end)
-
-copyBtn.Activated:Connect(function()
+local function clipboardText()
 	local text = fullText()
 	if text == "" and logLabel then
-		text = logLabel.Text
+		local plain = logLabel.ContentText
+		if type(plain) ~= "string" or plain == "" then
+			plain = logLabel.Text
+		end
+		text = plain or ""
 	end
+	text = string.gsub(text, "%z", "")
+	text = string.gsub(text, "<font[^>]*>", "")
+	text = string.gsub(text, "</font>", "")
+	text = string.gsub(text, "&lt;", "<")
+	text = string.gsub(text, "&gt;", ">")
+	text = string.gsub(text, "&amp;", "&")
+	return text
+end
+
+local function tryClip(fn, text)
+	if typeof(fn) ~= "function" then
+		return false, "assente"
+	end
+	local ok, err = pcall(function()
+		fn(text)
+	end)
+	if not ok then
+		return false, err
+	end
+	if typeof(gGetClip) == "function" then
+		local rok, got = pcall(gGetClip)
+		if rok and type(got) == "string" and #got > 0 then
+			return true
+		end
+	end
+	return true
+end
+
+local function doCopy()
+	if not alive or copying then
+		return
+	end
+	copying = true
+	local text = clipboardText()
 	if text == "" then
-		setStatus("niente da copiare")
+		copying = false
+		setStatus("niente da copiare", 4)
 		return
 	end
-	if typeof(setclipboard) ~= "function" then
-		setStatus("setclipboard assente")
-		push("[ERR] setclipboard assente")
-		return
+	local ok, err = tryClip(gClip, text)
+	if not ok then
+		ok, err = tryClip(setclipboard, text)
 	end
-	local ok, err = pcall(setclipboard, text)
+	if not ok then
+		ok, err = tryClip(gClip2, text)
+	end
+	if not ok then
+		ok, err = tryClip(bare("setclipboard"), text)
+	end
+	if not ok then
+		ok, err = tryClip(bare("toclipboard"), text)
+	end
+	if not ok then
+		ok, err = tryClip(bare("setrbxclipboard"), text)
+	end
+	if not ok and typeof(getgenv) == "function" then
+		local genv = getgenv()
+		if type(genv) == "table" then
+			ok, err = tryClip(genv.setclipboard, text)
+			if not ok and type(genv.clipboard) == "table" then
+				ok, err = tryClip(genv.clipboard.set, text)
+			end
+		end
+	end
+	copying = false
 	if ok then
-		setStatus("copiato (" .. #lines .. " righe)")
+		setStatus("COPIA OK " .. tostring(#text) .. " chars", 6)
+		print("[DeltaLogger] COPIA OK " .. tostring(#text))
 	else
-		setStatus("copia fallita")
-		push("[ERR] setclipboard: " .. tostring(err))
+		setStatus("COPIA fallita", 6)
+		push("[ERR] COPIA " .. tostring(err))
+		print("[DeltaLogger] COPIA FAIL " .. tostring(err))
 	end
-end)
+end
+
+copyBtn.MouseButton1Click:Connect(doCopy)
+copyBtn.Activated:Connect(doCopy)
 
 ENV.__DeltaLoggerKill = function()
 	alive = false
