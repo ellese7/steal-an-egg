@@ -56,7 +56,7 @@ if typeof(ENV.__DeltaLoggerKill) == "function" then
 	pcall(ENV.__DeltaLoggerKill)
 end
 
-local WORDS = { "sell", "vend", "selection", "egg" }
+local WORDS = { "sell", "vend", "selection", "pet", "egg" }
 local NOISE = { "probesatchel", "rigsync" }
 local METHODS = {
 	FireServer = true,
@@ -92,6 +92,8 @@ local kept = {}
 local seen = {}
 local shown = 0
 local skipped = 0
+local ownedByUid = {}
+local ownedByName = {}
 local logLabel
 local statusLbl
 local eggLbl
@@ -202,13 +204,25 @@ local function render()
 	logLabel.Text = text
 end
 
+local function richEsc(s)
+	return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
 local function push(line)
-	lines[#lines + 1] = tostring(line)
+	line = tostring(line)
+	if string.sub(line, 1, 5) ~= "<font" then
+		line = richEsc(line)
+	end
+	lines[#lines + 1] = line
 	render()
 end
 
 local function pushPin(line)
-	pinned[#pinned + 1] = tostring(line)
+	line = tostring(line)
+	if string.sub(line, 1, 5) ~= "<font" then
+		line = richEsc(line)
+	end
+	pinned[#pinned + 1] = line
 	while #pinned > 24 do
 		table.remove(pinned, 1)
 	end
@@ -231,14 +245,70 @@ local function isNoise(path)
 	return false
 end
 
+local function argsMatchOwned(...)
+	local found = {}
+	local function walk(v, depth, seenT)
+		if depth > 5 or v == nil then
+			return
+		end
+		local tv = typeof(v)
+		if tv == "string" then
+			local key = string.lower(v)
+			local rec = ownedByUid[key] or ownedByName[key]
+			if rec and not found[rec] then
+				found[rec] = true
+				found[#found + 1] = rec
+			end
+			return
+		end
+		if tv ~= "table" then
+			return
+		end
+		seenT = seenT or {}
+		if seenT[v] then
+			return
+		end
+		seenT[v] = true
+		local n = 0
+		for k, val in pairs(v) do
+			n = n + 1
+			if n > 40 then
+				break
+			end
+			walk(k, depth + 1, seenT)
+			walk(val, depth + 1, seenT)
+		end
+	end
+	local n = select("#", ...)
+	for i = 1, n do
+		walk(select(i, ...), 0, nil)
+	end
+	return found
+end
+
+local function attrBlock(rec)
+	local parts = {}
+	if rec.path then
+		parts[#parts + 1] = "  istanza: " .. rec.path
+	end
+	local attrs = rec.attrs
+	if type(attrs) ~= "table" then
+		return table.concat(parts, "\n")
+	end
+	for k, v in pairs(attrs) do
+		local ok, piece = pcall(fmt, v, 0, nil)
+		parts[#parts + 1] = "  attr " .. tostring(k) .. " = " .. (ok and piece or "?")
+	end
+	return table.concat(parts, "\n")
+end
+
 local function note(method, self, ...)
 	local name = "?"
 	local path = "?"
 	if typeof(self) == "Instance" then
 		name = tostring(self.Name)
 		path = name
-		local class = self.ClassName
-		if class == "RemoteEvent" or class == "RemoteFunction" then
+		if self.ClassName == "RemoteEvent" or self.ClassName == "RemoteFunction" then
 			local ok, full = pcall(function()
 				return self:GetFullName()
 			end)
@@ -246,6 +316,16 @@ local function note(method, self, ...)
 				path = full
 			end
 		end
+	end
+	if not matches(name) and not matches(path) then
+		return
+	end
+	if isNoise(path) then
+		return
+	end
+	local hits = argsMatchOwned(...)
+	if #hits == 0 then
+		return
 	end
 	local args = argsText(...)
 	local key = method .. "\0" .. path .. "\0" .. args
@@ -257,16 +337,16 @@ local function note(method, self, ...)
 	seen[key] = now
 	shown = shown + 1
 	local stamp = os.date("%H:%M:%S")
-	local interesting = (matches(name) or matches(path)) and not isNoise(path)
-	local tag = interesting and "VENDITA" or (isNoise(path) and "RUMORE" or "REMOTE")
-	local block = string.format("[%s] %s %s  %s\n%s", stamp, tag, method, path, args)
-	if interesting then
-		pushPin(block)
-	else
-		push(block)
+	local body = string.format("[%s] [INVENTARIO] %s  %s\n%s", stamp, method, path, args)
+	for i = 1, #hits do
+		local extra = attrBlock(hits[i])
+		if extra ~= "" then
+			body = body .. "\n" .. extra
+		end
 	end
+	pushPin('<font color="rgb(80,220,140)">' .. richEsc(body) .. "</font>")
 	if running then
-		setStatus(string.format("in ascolto — %d nuovi, %d ripetuti", shown, skipped))
+		setStatus("in ascolto — inventario " .. tostring(shown))
 	end
 end
 
@@ -312,7 +392,10 @@ local function installHook()
 			if typeof(method) == "string" then
 				local lowm = string.lower(method)
 				if lowm == "fireserver" or lowm == "invokeserver" then
-					enqueue(method, self, ...)
+					local nm = typeof(self) == "Instance" and self.Name or ""
+					if matches(nm) then
+						enqueue(method, self, ...)
+					end
 				end
 			end
 		end
@@ -357,7 +440,7 @@ screen.Parent = guiParent
 
 local frame = Instance.new("Frame")
 frame.Name = "Panel"
-frame.Size = UDim2.fromOffset(340, 320)
+frame.Size = UDim2.fromOffset(340, 390)
 frame.Position = UDim2.fromOffset(12, 12)
 frame.BackgroundColor3 = COL.panel
 frame.BorderSizePixel = 0
@@ -376,7 +459,7 @@ title.Font = Enum.Font.GothamBold
 title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = COL.text
-title.Text = "   Logger v3"
+title.Text = "   Logger v4"
 title.Active = true
 title.ZIndex = 5
 title.Parent = frame
@@ -384,10 +467,10 @@ local titleCorner = Instance.new("UICorner")
 titleCorner.CornerRadius = UDim.new(0, 10)
 titleCorner.Parent = title
 
-local function makeBtn(text, color, x)
+local function makeBtn(text, color, x, y, w)
 	local b = Instance.new("TextButton")
-	b.Size = UDim2.fromOffset(148, 32)
-	b.Position = UDim2.fromOffset(x, 42)
+	b.Size = UDim2.fromOffset(w or 148, 32)
+	b.Position = UDim2.fromOffset(x, y or 42)
 	b.BackgroundColor3 = color
 	b.BorderSizePixel = 0
 	b.Font = Enum.Font.GothamBold
@@ -404,12 +487,13 @@ local function makeBtn(text, color, x)
 	return b
 end
 
-startBtn = makeBtn("START", COL.idle, 14)
-local copyBtn = makeBtn("COPIA", COL.copy, 176)
+startBtn = makeBtn("START", COL.idle, 14, 40, 148)
+local copyBtn = makeBtn("COPIA", COL.copy, 176, 40, 148)
+local dumpBtn = makeBtn("DUMP INVENTORY", COL.accent, 14, 78, 312)
 
 statusLbl = Instance.new("TextLabel")
 statusLbl.Size = UDim2.new(1, -24, 0, 18)
-statusLbl.Position = UDim2.fromOffset(14, 78)
+statusLbl.Position = UDim2.fromOffset(14, 116)
 statusLbl.BackgroundTransparency = 1
 statusLbl.Font = Enum.Font.Gotham
 statusLbl.TextSize = 12
@@ -420,19 +504,19 @@ statusLbl.Parent = frame
 
 eggLbl = Instance.new("TextLabel")
 eggLbl.Size = UDim2.new(1, -24, 0, 16)
-eggLbl.Position = UDim2.fromOffset(14, 96)
+eggLbl.Position = UDim2.fromOffset(14, 136)
 eggLbl.BackgroundTransparency = 1
 eggLbl.Font = Enum.Font.GothamBold
 eggLbl.TextSize = 12
 eggLbl.TextXAlignment = Enum.TextXAlignment.Left
 eggLbl.TextColor3 = COL.accent
-eggLbl.Text = "v3 — uova: in attesa di START"
+eggLbl.Text = "v4 — inventario: in attesa"
 eggLbl.Parent = frame
 
 local scroll = Instance.new("ScrollingFrame")
 scroll.Name = "Log"
-scroll.Size = UDim2.new(1, -20, 1, -126)
-scroll.Position = UDim2.fromOffset(10, 116)
+scroll.Size = UDim2.new(1, -20, 1, -168)
+scroll.Position = UDim2.fromOffset(10, 156)
 scroll.BackgroundColor3 = Color3.fromRGB(8, 10, 14)
 scroll.BorderSizePixel = 0
 scroll.ScrollBarThickness = 4
@@ -453,6 +537,7 @@ logLabel.TextXAlignment = Enum.TextXAlignment.Left
 logLabel.TextYAlignment = Enum.TextYAlignment.Top
 logLabel.TextColor3 = COL.text
 logLabel.TextWrapped = true
+logLabel.RichText = true
 logLabel.Text = ""
 logLabel.AutomaticSize = Enum.AutomaticSize.Y
 logLabel.Parent = scroll
@@ -916,6 +1001,7 @@ local function scanOwnedEggs()
 	end
 	render()
 end
+local scan_inventory
 local function requestEggScan()
 	if scanQueued or not running then
 		return
@@ -924,16 +1010,151 @@ local function requestEggScan()
 	task.delay(0.5, function()
 		scanQueued = false
 		if alive and running then
-			local okScan, scanErr = pcall(scanOwnedEggs)
+			local okScan, scanErr = pcall(scan_inventory)
 			if not okScan then
-				kept = { "=== uova v3 ===", "SCAN ERR " .. tostring(scanErr) }
+				kept = { "=== inventario v4 ===", "SCAN ERR " .. tostring(scanErr) }
 				if eggLbl then
-					eggLbl.Text = "v3 — scan errore"
+					eggLbl.Text = "v4 — scan errore"
 				end
 				render()
 			end
 		end
 	end)
+end
+
+scan_inventory = function()
+	ownedByUid = {}
+	ownedByName = {}
+	local out = { "=== inventario v4 ===" }
+	local n = 0
+
+	local function addItem(inst, where)
+		if n >= 80 or typeof(inst) ~= "Instance" then
+			return
+		end
+		local attrs = {}
+		pcall(function()
+			attrs = inst:GetAttributes() or {}
+		end)
+		local uid = attrs.UID or attrs.EggUid or attrs.Uid or attrs.Id
+		local nome = attrs.DisplayName or attrs.EggName or inst.Name
+		if typeof(uid) ~= "string" then
+			uid = nil
+		end
+		nome = tostring(nome)
+		local rec = {
+			name = nome,
+			uid = uid,
+			path = where,
+			attrs = attrs,
+		}
+		if uid then
+			ownedByUid[string.lower(uid)] = rec
+		end
+		if nome ~= "" and #nome >= 3 and string.match(nome, "^%d+$") == nil then
+			ownedByName[string.lower(nome)] = rec
+		end
+		n = n + 1
+		out[#out + 1] = string.format("ITEM %s | uid=%s", nome, uid or "?")
+		out[#out + 1] = "  dove: " .. where
+		local keys = 0
+		for k, v in pairs(attrs) do
+			keys = keys + 1
+			local ok, piece = pcall(fmt, v, 0, nil)
+			out[#out + 1] = "  attr " .. tostring(k) .. " = " .. (ok and piece or "?")
+		end
+		if keys == 0 then
+			out[#out + 1] = "  attr (nessuno)"
+		end
+		for _, ch in ipairs(inst:GetChildren()) do
+			if ch:IsA("ValueBase") then
+				local val = "?"
+				pcall(function()
+					val = fmt(ch.Value, 0, nil)
+				end)
+				out[#out + 1] = "  value " .. ch.Name .. " = " .. val
+			end
+		end
+	end
+
+	local function scanTools(folder)
+		if not folder then
+			return
+		end
+		local ok, kids = pcall(function()
+			return folder:GetChildren()
+		end)
+		if not ok or not kids then
+			return
+		end
+		for i = 1, #kids do
+			if kids[i]:IsA("Tool") then
+				local path = kids[i].Name
+				pcall(function()
+					path = kids[i]:GetFullName()
+				end)
+				addItem(kids[i], path)
+			end
+		end
+	end
+
+	scanTools(LP:FindFirstChild("Backpack"))
+	scanTools(LP.Character)
+
+	for _, ch in ipairs(LP:GetChildren()) do
+		local ln = string.lower(ch.Name)
+		if ch ~= LP.Character and (string.find(ln, "satchel", 1, true) or string.find(ln, "invent", 1, true)) then
+			local path = ch.Name
+			pcall(function()
+				path = ch:GetFullName()
+			end)
+			addItem(ch, path)
+			for _, sub in ipairs(ch:GetChildren()) do
+				local sp = sub.Name
+				pcall(function()
+					sp = sub:GetFullName()
+				end)
+				addItem(sub, sp)
+			end
+		end
+	end
+
+	local pg = LP:FindFirstChild("PlayerGui")
+	local bag = pg and pg:FindFirstChild("BackpackGui")
+	local scrollFrame = bag and bag:FindFirstChild("Backpack")
+	scrollFrame = scrollFrame and scrollFrame:FindFirstChild("Main")
+	scrollFrame = scrollFrame and scrollFrame:FindFirstChild("Inventory")
+	scrollFrame = scrollFrame and scrollFrame:FindFirstChild("ScrollingFrame")
+	if scrollFrame then
+		for _, slot in ipairs(scrollFrame:GetChildren()) do
+			if slot.Name ~= "Template" and not slot:IsA("UILayout") and not slot:IsA("UIPadding") then
+				local path = slot.Name
+				pcall(function()
+					path = slot:GetFullName()
+				end)
+				local label = slot:FindFirstChild("ToolName", true)
+				if label and label:IsA("TextLabel") and typeof(label.Text) == "string" and label.Text ~= "" then
+					out[#out + 1] = "GUI " .. label.Text
+					out[#out + 1] = "  dove: " .. path .. ".ToolName.Text"
+				end
+			end
+		end
+	else
+		out[#out + 1] = "BackpackGui inventario non trovato"
+	end
+
+	if n == 0 then
+		out[#out + 1] = "nessun Tool in Backpack/Character"
+	end
+	out[#out + 1] = "=== fine inventario v4 (" .. tostring(n) .. ") ==="
+	kept = out
+	if eggLbl then
+		eggLbl.Text = "v4 — inventario: " .. tostring(n)
+	end
+	for i = 1, #out do
+		print(out[i])
+	end
+	render()
 end
 
 local function setRunning(on)
@@ -975,13 +1196,13 @@ startBtn.Activated:Connect(function()
 	anyHits = 0
 	fireHits = 0
 	setRunning(true)
-	push("[OK] ascolto ogni FireServer/InvokeServer")
-	push("se namecall resta 0, l'hook non vede le chiamate")
-	local okScan, scanErr = pcall(scanOwnedEggs)
+	push("[OK] v4 in ascolto. Solo uova/pet dell'inventario.")
+	push("DUMP INVENTORY aggiorna gli uid prima di vendere.")
+	local okScan, scanErr = pcall(scan_inventory)
 	if not okScan then
-		kept = { "=== uova v3 ===", "SCAN ERR " .. tostring(scanErr) }
+		kept = { "=== inventario v4 ===", "SCAN ERR " .. tostring(scanErr) }
 		if eggLbl then
-			eggLbl.Text = "v3 — scan errore"
+			eggLbl.Text = "v4 — scan errore"
 		end
 		render()
 	end
@@ -1015,7 +1236,20 @@ RunService.Heartbeat:Connect(function()
 	end
 	if running and #methodList > 0 and anyHits >= 30 and not methodSeen.__dumped then
 		methodSeen.__dumped = true
-		push("metodi visti: " .. table.concat(methodList, ", "))
+	end
+end)
+
+dumpBtn.Activated:Connect(function()
+	if not alive then
+		return
+	end
+	local okScan, scanErr = pcall(scan_inventory)
+	if not okScan then
+		kept = { "=== inventario v4 ===", "SCAN ERR " .. tostring(scanErr) }
+		if eggLbl then
+			eggLbl.Text = "v4 — scan errore"
+		end
+		render()
 	end
 end)
 
