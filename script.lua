@@ -1,203 +1,447 @@
--- ==========================================
--- SPEED HACK CON SPOOF (Delta / Xeno)
--- ==========================================
+--!optimize 2
+--[[
+  delta_logger.lua — Delta Executor
+  Non vende e non chiama nessun remote.
+  START aggancia __namecall e logga FireServer/InvokeServer
+  il cui nome contiene sell / pet / egg / selection / satchel.
+  COPIA copia il testo del logger negli appunti.
+  Rieseguire lo script sostituisce il precedente.
+]]
+
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local LocalPlayer = Players.LocalPlayer
+local UIS = game:GetService("UserInputService")
 
-local isEnabled = false
-local targetSpeed = 60
-local safeSpoofSpeed = 16 -- Velocità che il server crede che tu stia usando
+local LP = Players.LocalPlayer
 
--- ==========================================
--- 1. CREAZIONE GUI
--- ==========================================
-local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "SpeedSpoofer"
-ScreenGui.ResetOnSpawn = false
-ScreenGui.Parent = game.CoreGui
+-- Cattura i globali PRIMA di dichiarare local con lo stesso nome.
+local gHook = hookmetamethod
+local gNamecall = getnamecallmethod
+local gClosure = newcclosure
+local gCaller = checkcaller
+local gClip = setclipboard
+local gClip2 = toclipboard
+local gHui = gethui
 
-local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 280, 0, 350)
-MainFrame.Position = UDim2.new(0.5, -140, 0.5, -175)
-MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-MainFrame.BorderSizePixel = 0
-MainFrame.Active = true
-MainFrame.Draggable = true
-MainFrame.Parent = ScreenGui
-
-local UICorner = Instance.new("UICorner")
-UICorner.CornerRadius = UDim.new(0, 8)
-UICorner.Parent = MainFrame
-
-local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(1, 0, 0, 40)
-Title.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-Title.Text = "Speed Spoofer (Delta)"
-Title.TextColor3 = Color3.fromRGB(0, 255, 150)
-Title.Font = Enum.Font.GothamBold
-Title.TextSize = 16
-Title.Parent = MainFrame
-
-local TitleCorner = Instance.new("UICorner")
-TitleCorner.CornerRadius = UDim.new(0, 8)
-TitleCorner.Parent = Title
-
--- Toggle Button
-local ToggleBtn = Instance.new("TextButton")
-ToggleBtn.Size = UDim2.new(1, -20, 0, 40)
-ToggleBtn.Position = UDim2.new(0, 10, 0, 50)
-ToggleBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-ToggleBtn.Text = "STATO: DISATTIVATO"
-ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-ToggleBtn.Font = Enum.Font.GothamBold
-ToggleBtn.TextSize = 14
-ToggleBtn.Parent = MainFrame
-
--- Speed Input
-local SpeedBox = Instance.new("TextBox")
-SpeedBox.Size = UDim2.new(1, -20, 0, 35)
-SpeedBox.Position = UDim2.new(0, 10, 0, 100)
-SpeedBox.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-SpeedBox.TextColor3 = Color3.fromRGB(255, 255, 255)
-SpeedBox.PlaceholderText = "Inserisci Velocità (es. 60)"
-SpeedBox.Text = tostring(targetSpeed)
-SpeedBox.Font = Enum.Font.Gotham
-SpeedBox.TextSize = 14
-SpeedBox.Parent = MainFrame
-
--- Logger Frame
-local LoggerFrame = Instance.new("ScrollingFrame")
-LoggerFrame.Size = UDim2.new(1, -20, 0, 140)
-LoggerFrame.Position = UDim2.new(0, 10, 0, 145)
-LoggerFrame.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
-LoggerFrame.BorderSizePixel = 0
-LoggerFrame.ScrollBarThickness = 4
-LoggerFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
-LoggerFrame.Parent = MainFrame
-
-local LoggerLayout = Instance.new("UIListLayout")
-LoggerLayout.Padding = UDim.new(0, 4)
-LoggerLayout.Parent = LoggerFrame
-
--- ==========================================
--- 2. SISTEMA DI LOGGING
--- ==========================================
-local function AddLog(text, color)
-    local timestamp = os.date("%H:%M:%S")
-    local logLabel = Instance.new("TextLabel")
-    logLabel.Size = UDim2.new(1, 0, 0, 20)
-    logLabel.BackgroundTransparency = 1
-    logLabel.Text = "[" .. timestamp .. "] " .. text
-    logLabel.TextColor3 = color or Color3.fromRGB(200, 200, 200)
-    logLabel.Font = Enum.Font.Code
-    logLabel.TextSize = 12
-    logLabel.TextXAlignment = Enum.TextXAlignment.Left
-    logLabel.Parent = LoggerFrame
-    
-    -- Auto scroll
-    task.wait()
-    LoggerFrame.CanvasSize = UDim2.new(0, 0, 0, LoggerLayout.AbsoluteContentSize.Y)
-    LoggerFrame.CanvasPosition = Vector2.new(0, LoggerLayout.AbsoluteContentSize.Y)
+local function bare(name)
+	local ok, fn = pcall(function()
+		local loader = loadstring or load
+		if typeof(loader) ~= "function" then
+			return nil
+		end
+		local chunk = loader("return " .. name)
+		if typeof(chunk) ~= "function" then
+			return nil
+		end
+		return chunk()
+	end)
+	if ok and typeof(fn) == "function" then
+		return fn
+	end
+	return nil
 end
 
--- Hook dei print per vederli nel logger
-local oldPrint = print
-print = function(...)
-    local args = {...}
-    local str = ""
-    for i, v in ipairs(args) do
-        str = str .. tostring(v) .. (i < #args and " " or "")
-    end
-    AddLog(str, Color3.fromRGB(0, 200, 255))
-    oldPrint(...)
+local hookmetamethod = (typeof(gHook) == "function" and gHook) or bare("hookmetamethod")
+local getnamecallmethod = (typeof(gNamecall) == "function" and gNamecall) or bare("getnamecallmethod")
+local newcclosure = (typeof(gClosure) == "function" and gClosure) or bare("newcclosure") or function(f)
+	return f
+end
+local checkcaller = (typeof(gCaller) == "function" and gCaller) or bare("checkcaller")
+local setclipboard = (typeof(gClip) == "function" and gClip) or (typeof(gClip2) == "function" and gClip2) or bare("setclipboard")
+local gethui = (typeof(gHui) == "function" and gHui) or bare("gethui")
+
+local ENV = (typeof(getgenv) == "function" and getgenv()) or _G
+if typeof(ENV.__DeltaLoggerKill) == "function" then
+	pcall(ENV.__DeltaLoggerKill)
 end
 
--- ==========================================
--- 3. LOGICA DI SPOOF E MOVIMENTO
--- ==========================================
-local CurrentBodyVelocity = nil
+local WORDS = { "sell", "pet", "egg", "selection", "satchel" }
+local METHODS = {
+	FireServer = true,
+	InvokeServer = true,
+	fireServer = true,
+	invokeServer = true,
+}
+local MAX_CHARS = 10000
 
-local function ApplySpeed()
-    local char = LocalPlayer.Character
-    if not char then return end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    local hum = char:FindFirstChild("Humanoid")
-    if not hrp or not hum then return end
+local COL = {
+	panel = Color3.fromRGB(14, 16, 22),
+	bar = Color3.fromRGB(22, 26, 34),
+	text = Color3.fromRGB(236, 240, 248),
+	muted = Color3.fromRGB(150, 160, 176),
+	idle = Color3.fromRGB(55, 62, 74),
+	on = Color3.fromRGB(36, 140, 88),
+	copy = Color3.fromRGB(40, 75, 130),
+}
 
-    -- Rimuovi il BodyVelocity precedente se esiste
-    if CurrentBodyVelocity then
-        CurrentBodyVelocity:Destroy()
-    end
+local alive = true
+local running = false
+local busy = false
+local oldNamecall
+local hooked = false
+local lines = {}
+local logLabel
+local statusLbl
+local startBtn
 
-    if isEnabled then
-        -- Creiamo la spinta fisica
-        local bv = Instance.new("BodyVelocity")
-        bv.Name = "SpeedSpoofBV"
-        bv.MaxForce = Vector3.new(math.huge, 0, math.huge) -- Solo orizzontale per non volare
-        bv.Velocity = Vector3.new(0, 0, 0)
-        bv.Parent = hrp
-        CurrentBodyVelocity = bv
-        AddLog("Spinta fisica attivata: " .. targetSpeed, Color3.fromRGB(0, 255, 0))
-    else
-        AddLog("Spinta fisica disattivata.", Color3.fromRGB(255, 100, 100))
-    end
+local function low(s)
+	return string.lower(tostring(s or ""))
 end
 
--- Hook per far credere al gioco che WalkSpeed sia sicuro
-local oldIndex
-oldIndex = hookmetamethod(game, "__index", function(self, key)
-    if self:IsA("Humanoid") and key == "WalkSpeed" and isEnabled then
-        return safeSpoofSpeed -- Il server vede questo valore
-    end
-    return oldIndex(self, key)
+local function matches(name)
+	name = low(name)
+	for i = 1, #WORDS do
+		if string.find(name, WORDS[i], 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function fmt(v, depth, seen)
+	depth = depth or 0
+	if depth > 3 then
+		return "…"
+	end
+	local tv = typeof(v)
+	if tv == "string" then
+		if #v > 160 then
+			return string.format("%q…", string.sub(v, 1, 160))
+		end
+		return string.format("%q", v)
+	end
+	if tv == "number" or tv == "boolean" or tv == "nil" then
+		return tostring(v)
+	end
+	if tv == "Instance" then
+		local ok, path = pcall(function()
+			return v:GetFullName()
+		end)
+		if ok and path then
+			return v.ClassName .. "<" .. path .. ">"
+		end
+		return v.ClassName .. "<" .. v.Name .. ">"
+	end
+	if tv ~= "table" then
+		local ok, text = pcall(tostring, v)
+		return tv .. "(" .. (ok and text or "?") .. ")"
+	end
+	seen = seen or {}
+	if seen[v] then
+		return "{cycle}"
+	end
+	seen[v] = true
+	local parts = {}
+	local n = 0
+	for k, val in pairs(v) do
+		n = n + 1
+		if n > 12 then
+			parts[#parts + 1] = "…"
+			break
+		end
+		local ok, piece = pcall(fmt, val, depth + 1, seen)
+		parts[#parts + 1] = tostring(k) .. "=" .. (ok and piece or "?")
+	end
+	if n == 0 then
+		return "{}"
+	end
+	return "{" .. table.concat(parts, ", ") .. "}"
+end
+
+local function argsText(...)
+	local n = select("#", ...)
+	if n == 0 then
+		return "(nessun argomento)"
+	end
+	local parts = {}
+	for i = 1, n do
+		local ok, piece = pcall(fmt, select(i, ...), 0, nil)
+		parts[i] = "[" .. i .. "] " .. (ok and piece or "?")
+	end
+	return table.concat(parts, "\n")
+end
+
+local function render()
+	if not logLabel then
+		return
+	end
+	local text = table.concat(lines, "\n")
+	while #text > MAX_CHARS and #lines > 1 do
+		table.remove(lines, 1)
+		text = table.concat(lines, "\n")
+	end
+	if #text > MAX_CHARS then
+		text = string.sub(text, #text - MAX_CHARS + 1)
+		lines = { text }
+	end
+	logLabel.Text = text
+end
+
+local function push(line)
+	lines[#lines + 1] = tostring(line)
+	render()
+end
+
+local function setStatus(s)
+	if statusLbl then
+		statusLbl.Text = s
+	end
+end
+
+local function note(method, self, ...)
+	if typeof(self) ~= "Instance" then
+		return
+	end
+	local class = self.ClassName
+	if class ~= "RemoteEvent" and class ~= "RemoteFunction" then
+		return
+	end
+	local name = self.Name
+	local path = name
+	pcall(function()
+		path = self:GetFullName()
+	end)
+	if not matches(name) and not matches(path) then
+		return
+	end
+	local stamp = os.date("%H:%M:%S")
+	push(string.format("[%s] %s  %s", stamp, method, path))
+	push(argsText(...))
+end
+
+local function installHook()
+	if hooked then
+		return true
+	end
+	if typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" then
+		push("[ERR] Delta: hookmetamethod o getnamecallmethod assente")
+		return false
+	end
+	local function hook(self, ...)
+		local method = getnamecallmethod()
+		if running and not busy and METHODS[method] then
+			if not checkcaller or not checkcaller() then
+				busy = true
+				pcall(note, method, self, ...)
+				busy = false
+			end
+		end
+		return oldNamecall(self, ...)
+	end
+	local ok, orig = pcall(hookmetamethod, game, "__namecall", newcclosure(hook))
+	if not ok or typeof(orig) ~= "function" then
+		push("[ERR] hookmetamethod: " .. tostring(orig))
+		return false
+	end
+	oldNamecall = orig
+	hooked = true
+	push("[OK] __namecall attivo")
+	return true
+end
+
+local function removeHook()
+	running = false
+	if hooked and typeof(oldNamecall) == "function" and typeof(hookmetamethod) == "function" then
+		pcall(hookmetamethod, game, "__namecall", oldNamecall)
+	end
+	hooked = false
+	oldNamecall = nil
+end
+
+local guiParent = LP:WaitForChild("PlayerGui")
+pcall(function()
+	if gethui then
+		local h = gethui()
+		if typeof(h) == "Instance" then
+			guiParent = h
+		end
+	end
 end)
 
--- Loop per muovere il personaggio
-RunService.RenderStepped:Connect(function()
-    if isEnabled and CurrentBodyVelocity then
-        local char = LocalPlayer.Character
-        if char then
-            local hum = char:FindFirstChild("Humanoid")
-            if hum and hum.MoveDirection.Magnitude > 0 then
-                -- Spingiamo il personaggio nella direzione in cui sta guardando
-                CurrentBodyVelocity.Velocity = hum.MoveDirection * targetSpeed
-            else
-                CurrentBodyVelocity.Velocity = Vector3.new(0, 0, 0)
-            end
-        end
-    end
+local screen = Instance.new("ScreenGui")
+screen.Name = "DeltaLogger"
+screen.ResetOnSpawn = false
+screen.IgnoreGuiInset = true
+screen.DisplayOrder = 900
+screen.Parent = guiParent
+
+local frame = Instance.new("Frame")
+frame.Name = "Panel"
+frame.Size = UDim2.fromOffset(340, 320)
+frame.Position = UDim2.fromOffset(12, 12)
+frame.BackgroundColor3 = COL.panel
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Parent = screen
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 10)
+corner.Parent = frame
+
+local title = Instance.new("TextLabel")
+title.Name = "Title"
+title.Size = UDim2.new(1, 0, 0, 32)
+title.BackgroundColor3 = COL.bar
+title.BorderSizePixel = 0
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextColor3 = COL.text
+title.Text = "   Logger vendita"
+title.Parent = frame
+local titleCorner = Instance.new("UICorner")
+titleCorner.CornerRadius = UDim.new(0, 10)
+titleCorner.Parent = title
+
+local function makeBtn(text, color, x)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(148, 32)
+	b.Position = UDim2.fromOffset(x, 42)
+	b.BackgroundColor3 = color
+	b.BorderSizePixel = 0
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 14
+	b.TextColor3 = COL.text
+	b.Text = text
+	b.AutoButtonColor = true
+	b.Parent = frame
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 8)
+	c.Parent = b
+	return b
+end
+
+startBtn = makeBtn("START", COL.idle, 14)
+local copyBtn = makeBtn("COPIA", COL.copy, 176)
+
+statusLbl = Instance.new("TextLabel")
+statusLbl.Size = UDim2.new(1, -24, 0, 18)
+statusLbl.Position = UDim2.fromOffset(14, 78)
+statusLbl.BackgroundTransparency = 1
+statusLbl.Font = Enum.Font.Gotham
+statusLbl.TextSize = 12
+statusLbl.TextXAlignment = Enum.TextXAlignment.Left
+statusLbl.TextColor3 = COL.muted
+statusLbl.Text = "fermo — START, vendi, COPIA"
+statusLbl.Parent = frame
+
+local scroll = Instance.new("ScrollingFrame")
+scroll.Name = "Log"
+scroll.Size = UDim2.new(1, -20, 1, -112)
+scroll.Position = UDim2.fromOffset(10, 102)
+scroll.BackgroundColor3 = Color3.fromRGB(8, 10, 14)
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 4
+scroll.CanvasSize = UDim2.new()
+scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroll.Parent = frame
+local scrollCorner = Instance.new("UICorner")
+scrollCorner.CornerRadius = UDim.new(0, 8)
+scrollCorner.Parent = scroll
+
+logLabel = Instance.new("TextLabel")
+logLabel.Size = UDim2.new(1, -12, 0, 0)
+logLabel.Position = UDim2.fromOffset(6, 6)
+logLabel.BackgroundTransparency = 1
+logLabel.Font = Enum.Font.Code
+logLabel.TextSize = 12
+logLabel.TextXAlignment = Enum.TextXAlignment.Left
+logLabel.TextYAlignment = Enum.TextYAlignment.Top
+logLabel.TextColor3 = COL.text
+logLabel.TextWrapped = true
+logLabel.Text = ""
+logLabel.AutomaticSize = Enum.AutomaticSize.Y
+logLabel.Parent = scroll
+
+local dragging = false
+local dragStart
+local startPos
+
+title.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = frame.Position
+	end
 end)
 
--- ==========================================
--- 4. GESTIONE EVENTI GUI
--- ==========================================
-ToggleBtn.MouseButton1Click:Connect(function()
-    isEnabled = not isEnabled
-    if isEnabled then
-        ToggleBtn.Text = "STATO: ATTIVATO"
-        ToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 0)
-        targetSpeed = tonumber(SpeedBox.Text) or 60
-        ApplySpeed()
-    else
-        ToggleBtn.Text = "STATO: DISATTIVATO"
-        ToggleBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-        ApplySpeed()
-    end
+title.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = false
+	end
 end)
 
-SpeedBox.FocusLost:Connect(function()
-    targetSpeed = tonumber(SpeedBox.Text) or 60
-    if isEnabled then ApplySpeed() end
+UIS.InputChanged:Connect(function(input)
+	if not dragging then
+		return
+	end
+	if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then
+		return
+	end
+	local delta = input.Position - dragStart
+	frame.Position = UDim2.new(
+		startPos.X.Scale,
+		startPos.X.Offset + delta.X,
+		startPos.Y.Scale,
+		startPos.Y.Offset + delta.Y
+	)
 end)
 
--- Riapplica in caso di respawn
-LocalPlayer.CharacterAdded:Connect(function()
-    if isEnabled then
-        task.wait(1)
-        ApplySpeed()
-    end
+local function setRunning(on)
+	running = on
+	if on then
+		startBtn.Text = "STOP"
+		startBtn.BackgroundColor3 = COL.on
+		setStatus("in ascolto — vendi un uovo")
+	else
+		startBtn.Text = "START"
+		startBtn.BackgroundColor3 = COL.idle
+		setStatus("fermo — COPIA")
+	end
+end
+
+startBtn.MouseButton1Click:Connect(function()
+	if not alive then
+		return
+	end
+	if running then
+		setRunning(false)
+		push("[STOP]")
+		return
+	end
+	if not installHook() then
+		setRunning(false)
+		setStatus("hook non partito")
+		return
+	end
+	setRunning(true)
 end)
 
-AddLog("Script caricato con successo. Pronto.", Color3.fromRGB(255, 255, 0))
+copyBtn.MouseButton1Click:Connect(function()
+	local text = table.concat(lines, "\n")
+	if text == "" then
+		setStatus("niente da copiare")
+		return
+	end
+	if typeof(setclipboard) ~= "function" then
+		setStatus("setclipboard assente")
+		push("[ERR] setclipboard assente")
+		return
+	end
+	local ok, err = pcall(setclipboard, text)
+	if ok then
+		setStatus("copiato (" .. #lines .. " righe)")
+	else
+		setStatus("copia fallita")
+		push("[ERR] setclipboard: " .. tostring(err))
+	end
+end)
+
+ENV.__DeltaLoggerKill = function()
+	alive = false
+	running = false
+	removeHook()
+	pcall(function()
+		screen:Destroy()
+	end)
+end
+
+push("Pronto. START, vendi un uovo, COPIA.")
