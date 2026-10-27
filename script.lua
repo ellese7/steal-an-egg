@@ -2,8 +2,9 @@
 --[[
   delta_logger.lua — Delta Executor
   Non vende e non chiama nessun remote.
-  START aggancia __namecall e logga FireServer/InvokeServer
-  il cui nome contiene sell / pet / egg / selection / satchel.
+  START aggancia __namecall e logga ogni FireServer/InvokeServer.
+  I doppioni si saltano. Le chiamate sell/vend/selection/egg restano in cima.
+  ProbeSatchel non basta a riconoscere una vendita.
   COPIA copia il testo del logger negli appunti.
   Rieseguire lo script sostituisce il precedente.
 ]]
@@ -54,7 +55,8 @@ if typeof(ENV.__DeltaLoggerKill) == "function" then
 	pcall(ENV.__DeltaLoggerKill)
 end
 
-local WORDS = { "sell", "pet", "egg", "selection", "satchel" }
+local WORDS = { "sell", "vend", "selection", "egg" }
+local NOISE = { "probesatchel", "rigsync" }
 local METHODS = {
 	FireServer = true,
 	InvokeServer = true,
@@ -79,6 +81,10 @@ local busy = false
 local oldNamecall
 local hooked = false
 local lines = {}
+local pinned = {}
+local seen = {}
+local shown = 0
+local skipped = 0
 local logLabel
 local statusLbl
 local startBtn
@@ -160,18 +166,27 @@ local function argsText(...)
 	return table.concat(parts, "\n")
 end
 
+local function fullText()
+	local chunks = {}
+	if #pinned > 0 then
+		chunks[#chunks + 1] = table.concat(pinned, "\n")
+	end
+	if #lines > 0 then
+		chunks[#chunks + 1] = table.concat(lines, "\n")
+	end
+	return table.concat(chunks, "\n")
+end
+
 local function render()
 	if not logLabel then
 		return
 	end
-	local text = table.concat(lines, "\n")
-	while #text > MAX_CHARS and #lines > 1 do
+	while #fullText() > MAX_CHARS and #lines > 1 do
 		table.remove(lines, 1)
-		text = table.concat(lines, "\n")
 	end
+	local text = fullText()
 	if #text > MAX_CHARS then
 		text = string.sub(text, #text - MAX_CHARS + 1)
-		lines = { text }
 	end
 	logLabel.Text = text
 end
@@ -181,10 +196,28 @@ local function push(line)
 	render()
 end
 
+local function pushPin(line)
+	pinned[#pinned + 1] = tostring(line)
+	while #pinned > 24 do
+		table.remove(pinned, 1)
+	end
+	render()
+end
+
 local function setStatus(s)
 	if statusLbl then
 		statusLbl.Text = s
 	end
+end
+
+local function isNoise(path)
+	path = low(path)
+	for i = 1, #NOISE do
+		if string.find(path, NOISE[i], 1, true) then
+			return true
+		end
+	end
+	return false
 end
 
 local function note(method, self, ...)
@@ -200,12 +233,27 @@ local function note(method, self, ...)
 	pcall(function()
 		path = self:GetFullName()
 	end)
-	if not matches(name) and not matches(path) then
+	local args = argsText(...)
+	local key = method .. "\0" .. path .. "\0" .. args
+	local now = os.clock()
+	if seen[key] and (now - seen[key]) < 2 then
+		skipped = skipped + 1
 		return
 	end
+	seen[key] = now
+	shown = shown + 1
 	local stamp = os.date("%H:%M:%S")
-	push(string.format("[%s] %s  %s", stamp, method, path))
-	push(argsText(...))
+	local interesting = (matches(name) or matches(path)) and not isNoise(path)
+	local tag = interesting and "VENDITA" or (isNoise(path) and "RUMORE" or "REMOTE")
+	local block = string.format("[%s] %s %s  %s\n%s", stamp, tag, method, path, args)
+	if interesting then
+		pushPin(block)
+	else
+		push(block)
+	end
+	if running then
+		setStatus(string.format("in ascolto — %d nuovi, %d ripetuti", shown, skipped))
+	end
 end
 
 local function installHook()
@@ -218,6 +266,7 @@ local function installHook()
 	end
 	local function hook(self, ...)
 		local method = getnamecallmethod()
+		method = type(method) == "string" and method or ""
 		if running and not busy and METHODS[method] then
 			if not checkcaller or not checkcaller() then
 				busy = true
@@ -412,11 +461,18 @@ startBtn.MouseButton1Click:Connect(function()
 		setStatus("hook non partito")
 		return
 	end
+	lines = {}
+	pinned = {}
+	seen = {}
+	shown = 0
+	skipped = 0
 	setRunning(true)
+	push("[OK] ascolto ogni FireServer/InvokeServer")
+	push("doppioni saltati — VENDITA resta in cima")
 end)
 
 copyBtn.MouseButton1Click:Connect(function()
-	local text = table.concat(lines, "\n")
+	local text = logLabel and logLabel.Text or fullText()
 	if text == "" then
 		setStatus("niente da copiare")
 		return
@@ -445,3 +501,4 @@ ENV.__DeltaLoggerKill = function()
 end
 
 push("Pronto. START, vendi un uovo, COPIA.")
+push("ProbeSatchel e' rumore: cerca la riga VENDITA.")
