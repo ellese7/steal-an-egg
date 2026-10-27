@@ -525,7 +525,7 @@ eggLbl.Font = Enum.Font.GothamBold
 eggLbl.TextSize = 12
 eggLbl.TextXAlignment = Enum.TextXAlignment.Left
 eggLbl.TextColor3 = COL.accent
-eggLbl.Text = "v4 — inventario: in attesa"
+eggLbl.Text = "v5 — inventario: in attesa"
 eggLbl.Parent = frame
 
 local scroll = Instance.new("ScrollingFrame")
@@ -1012,7 +1012,7 @@ local function scanOwnedEggs()
 	add("=== fine uova v3 ===")
 	kept = out
 	if eggLbl then
-		eggLbl.Text = "v3 — uova: " .. tostring(eggCount)
+		eggLbl.Text = "v5 — inventario: " .. tostring(eggCount)
 	end
 	render()
 end
@@ -1027,9 +1027,9 @@ local function requestEggScan()
 		if alive and running then
 			local okScan, scanErr = pcall(scan_inventory)
 			if not okScan then
-				kept = { "=== inventario v4 ===", "SCAN ERR " .. tostring(scanErr) }
+				kept = { "=== inventario v5 ===", "SCAN ERR " .. tostring(scanErr) }
 				if eggLbl then
-					eggLbl.Text = "v4 — scan errore"
+					eggLbl.Text = "v5 — scan errore"
 				end
 				render()
 			end
@@ -1040,7 +1040,7 @@ end
 scan_inventory = function()
 	ownedByUid = {}
 	ownedByName = {}
-	local out = { "=== inventario v4 ===" }
+	local out = { "=== inventario v5 ===" }
 	local n = 0
 
 	local function addItem(inst, where)
@@ -1161,10 +1161,10 @@ scan_inventory = function()
 	if n == 0 then
 		out[#out + 1] = "nessun Tool in Backpack/Character"
 	end
-	out[#out + 1] = "=== fine inventario v4 (" .. tostring(n) .. ") ==="
+	out[#out + 1] = "=== fine inventario v5 (" .. tostring(n) .. ") ==="
 	kept = out
 	if eggLbl then
-		eggLbl.Text = "v4 — inventario: " .. tostring(n)
+		eggLbl.Text = "v5 — inventario: " .. tostring(n)
 	end
 	for i = 1, #out do
 		print(out[i])
@@ -1211,13 +1211,13 @@ startBtn.Activated:Connect(function()
 	anyHits = 0
 	fireHits = 0
 	setRunning(true)
-	push("[OK] v4 in ascolto. Solo uova/pet dell'inventario.")
+	push("[OK] v5 in ascolto. Solo uova/pet dell'inventario.")
 	push("START legge lo zaino. Poi vendi e premi COPIA.")
 	local okScan, scanErr = pcall(scan_inventory)
 	if not okScan then
-		kept = { "=== inventario v4 ===", "SCAN ERR " .. tostring(scanErr) }
+		kept = { "=== inventario v5 ===", "SCAN ERR " .. tostring(scanErr) }
 		if eggLbl then
-			eggLbl.Text = "v4 — scan errore"
+			eggLbl.Text = "v5 — scan errore"
 		end
 		render()
 	end
