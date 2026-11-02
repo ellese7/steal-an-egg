@@ -47,6 +47,7 @@ local function api(name)
 end
 
 local getconnections = api("getconnections")
+local getscriptclosure = api("getscriptclosure")
 local getgc = api("getgc")
 local getupvalue = api("getupvalue")
 local setupvalue = api("setupvalue")
@@ -224,73 +225,88 @@ local function describe(value)
 	return nil
 end
 
-local function makeProxy(real)
-	return setmetatable({}, {
-		__index = function(_, key)
-			if key == "Pet Walkspeed" then
-				return 10000
-			end
-			return real[key]
-		end,
-		__newindex = function(_, key, val)
-			if key == "Pet Walkspeed" then
-				return
-			end
-			real[key] = val
-		end,
-	})
+local PETS_SRC = "PlayerScripts.Scripts.Game.Pets"
+local announced = false
+
+local function isPetsSource(fn)
+	return string.find(sourceOf(fn), PETS_SRC, 1, true) ~= nil
 end
 
 local function remember(fn, index, kind, parent, realUpgrades, before)
 	for i = 1, #targets do
-		if targets[i].realUpgrades == realUpgrades then
+		if targets[i].originalUpgrades == realUpgrades then
 			return false
 		end
 	end
-	local proxy = makeProxy(realUpgrades)
+	if not announced then
+		announced = true
+		log("[FUNC] Trovata funzione: " .. cut(sourceOf(fn), 180))
+	end
 	targets[#targets + 1] = {
 		fn = fn,
 		index = index,
 		kind = kind,
 		parent = parent,
+		originalUpgrades = realUpgrades,
 		realUpgrades = realUpgrades,
-		proxy = proxy,
 		before = before,
+		mode = "none",
 	}
-	log(string.format("[UPVALUE] Trovato v113 | Upgrades.Pet Walkspeed = %s", tostring(before)))
+	log("[UPVALUE] Pet Walkspeed = " .. tostring(before))
 	return true
 end
 
-local function scanFunction(fn, how, seen, depth)
-	if typeof(fn) ~= "function" or seen[fn] or depth > 5 or isFake(fn) then
-		return
+local function harvest(fn, seen, depth)
+	if typeof(fn) ~= "function" or seen[fn] or depth > 6 or isFake(fn) then
+		return false
 	end
 	seen[fn] = true
-	local src = sourceOf(fn)
-	local interesting = hasConst(fn, "Pet Walkspeed") or string.find(src, "Game.Pets", 1, true) ~= nil
-	if interesting then
-		log(string.format("[FUNC] Trovata funzione: %s | upvalue: %d | via %s", cut(src, 140), upvalueCount(fn), how))
-	end
 	for i = 1, 80 do
 		local _, val, alive = upvalueAt(fn, i)
 		if not alive then
 			break
 		end
 		local kind, parent, level, up = describe(val)
-		if kind == "parent" then
-			remember(fn, i, "parent", parent, up, level)
-		elseif kind == "direct" then
-			remember(fn, i, "direct", nil, parent, level)
-		elseif typeof(val) == "function" then
-			scanFunction(val, how .. " uv", seen, depth + 1)
+		if kind == "parent" and remember(fn, i, "parent", parent, up, level) then
+			return true
+		end
+		if kind == "direct" and remember(fn, i, "direct", nil, parent, level) then
+			return true
+		end
+		if typeof(val) == "function" and harvest(val, seen, depth + 1) then
+			return true
 		end
 	end
-	if interesting or depth == 0 then
-		local kids = childProtos(fn)
-		for i = 1, #kids do
-			scanFunction(kids[i], how .. " proto", seen, depth + 1)
+	local kids = childProtos(fn)
+	for i = 1, #kids do
+		if harvest(kids[i], seen, depth + 1) then
+			return true
 		end
 	end
+	return false
+end
+
+local function findPets(fn, seen, depth)
+	if typeof(fn) ~= "function" or seen[fn] or depth > 4 or isFake(fn) then
+		return nil
+	end
+	seen[fn] = true
+	if isPetsSource(fn) then
+		return fn
+	end
+	for i = 1, 40 do
+		local _, val, alive = upvalueAt(fn, i)
+		if not alive then
+			break
+		end
+		if typeof(val) == "function" then
+			local hit = findPets(val, seen, depth + 1)
+			if hit then
+				return hit
+			end
+		end
+	end
+	return nil
 end
 
 local function connFunction(conn)
@@ -309,135 +325,98 @@ local function connFunction(conn)
 	return nil
 end
 
-local function scanSignal(signal, label, seen)
-	if typeof(getconnections) ~= "function" then
-		log("[ERR] getconnections assente")
-		return 0
-	end
-	local ok, list = pcall(getconnections, signal)
-	if not ok or typeof(list) ~= "table" then
-		log("[ERR] getconnections " .. label .. " " .. tostring(list))
-		return 0
-	end
-	local n = 0
-	for _, conn in pairs(list) do
-		n = n + 1
-		local fn = connFunction(conn)
-		if fn then
-			scanFunction(fn, label, seen, 0)
-		end
-	end
-	log(string.format("[FUNC] %s connessioni=%d", label, n))
-	return n
+local function petsInstance()
+	local ps = LocalPlayer:FindFirstChild("PlayerScripts")
+	local folder = ps and ps:FindFirstChild("Scripts")
+	folder = folder and folder:FindFirstChild("Game")
+	return folder and folder:FindFirstChild("Pets")
 end
 
-local function scanGc(seen)
-	if typeof(getgc) ~= "function" then
-		log("[ERR] getgc assente")
-		return
+local function copyMap(tbl)
+	local out = {}
+	if typeof(tbl) ~= "table" then
+		return out
 	end
-	local ok, bag = pcall(getgc, true)
-	if not ok or typeof(bag) ~= "table" then
-		log("[ERR] getgc " .. tostring(bag))
-		return
-	end
-	local seenN, fnN, hitN = 0, 0, 0
-	for _, obj in pairs(bag) do
-		seenN = seenN + 1
-		if typeof(obj) == "function" and not seen[obj] and hasConst(obj, "Pet Walkspeed") then
-			fnN = fnN + 1
-			local before = #targets
-			scanFunction(obj, "gc", seen, 0)
-			if #targets > before then
-				hitN = hitN + 1
-			end
+	pcall(function()
+		for k, v in pairs(tbl) do
+			out[k] = v
 		end
-		if seenN % 200 == 0 then
-			task.wait()
-		end
-	end
-	log(string.format("[FUNC] gc oggetti=%d con costante=%d con upvalue=%d", seenN, fnN, hitN))
+	end)
+	return out
 end
 
 local restore
 
 local function search()
-	if holding or #targets > 0 then
+	if #targets > 0 then
 		restore()
 	end
 	targets = {}
+	announced = false
 	local seen = {}
-	scanSignal(RunService.Heartbeat, "Heartbeat", seen)
-	if #targets == 0 then
-		scanSignal(RunService.RenderStepped, "RenderStepped", seen)
-	end
-	if #targets == 0 then
-		scanSignal(RunService.Stepped, "Stepped", seen)
-	end
-	if #targets == 0 then
-		scanGc(seen)
-	end
-	if #targets == 0 then
-		log("[UPVALUE] nessuno. Pet Walkspeed non e' in un upvalue raggiungibile")
+	if typeof(getconnections) ~= "function" then
+		log("[ERR] getconnections assente")
 	else
-		log(string.format("[UPVALUE] tabelle=%d", #targets))
-	end
-end
-
-local function forceOne(item)
-	if item.kind == "parent" and typeof(item.parent) == "table" then
-		rawset(item.parent, "Upgrades", item.proxy)
-		return true, nil
-	end
-	if typeof(setupvalue) ~= "function" then
-		return false, "setupvalue assente"
-	end
-	local _, now = upvalueAt(item.fn, item.index)
-	if now == item.proxy then
-		return true, nil
-	end
-	local ok, err = pcall(setupvalue, item.fn, item.index, item.proxy)
-	if not ok then
-		return false, err
-	end
-	return true, nil
-end
-
-local function forceAll()
-	local okN, err
-	for i = 1, #targets do
-		local ok, why = forceOne(targets[i])
-		if ok then
-			okN = (okN or 0) + 1
+		local ok, list = pcall(getconnections, RunService.Heartbeat)
+		if not ok or typeof(list) ~= "table" then
+			log("[ERR] getconnections Heartbeat " .. tostring(list))
 		else
-			err = why
+			for _, conn in pairs(list) do
+				local fn = connFunction(conn)
+				if fn and not isFake(fn) then
+					local hit = fn
+					if not isPetsSource(fn) then
+						hit = findPets(fn, {}, 0)
+					end
+					if hit and harvest(hit, seen, 0) then
+						return
+					end
+				end
+			end
 		end
 	end
-	return okN or 0, err
-end
-
-local function stopHold()
-	holding = false
-	if holdConn then
-		pcall(function()
-			holdConn:Disconnect()
-		end)
-		holdConn = nil
+	local pets = petsInstance()
+	if pets and typeof(getscriptclosure) == "function" then
+		local ok, fn = pcall(getscriptclosure, pets)
+		if ok and typeof(fn) == "function" and harvest(fn, seen, 0) then
+			return
+		end
 	end
+	if typeof(getgc) ~= "function" then
+		log("[UPVALUE] nessuno")
+		return
+	end
+	local okGc, bag = pcall(getgc, true)
+	if not okGc or typeof(bag) ~= "table" then
+		log("[ERR] getgc " .. tostring(bag))
+		log("[UPVALUE] nessuno")
+		return
+	end
+	local n = 0
+	for _, obj in pairs(bag) do
+		n = n + 1
+		if typeof(obj) == "function" and not seen[obj] and isPetsSource(obj) and harvest(obj, seen, 0) then
+			return
+		end
+		if n % 250 == 0 then
+			task.wait()
+		end
+	end
+	log("[UPVALUE] nessuno")
 end
 
 restore = function()
-	stopHold()
 	for i = 1, #targets do
 		local item = targets[i]
-		if item.kind == "parent" and typeof(item.parent) == "table" then
-			rawset(item.parent, "Upgrades", item.realUpgrades)
-		elseif typeof(setupvalue) == "function" then
-			pcall(setupvalue, item.fn, item.index, item.realUpgrades)
+		if item.mode == "setup" and item.backup ~= nil and typeof(setupvalue) == "function" then
+			pcall(setupvalue, item.fn, item.index, item.backup)
 		end
-		pcall(function()
-			item.realUpgrades["Pet Walkspeed"] = item.before
-		end)
+		if typeof(item.originalUpgrades) == "table" then
+			pcall(function()
+				item.originalUpgrades["Pet Walkspeed"] = item.before
+			end)
+		end
+		item.mode = "none"
 	end
 end
 
@@ -452,22 +431,59 @@ local function applyBoost()
 		log("[BOOST] Errore: v113.Upgrades non trovato")
 		return
 	end
-	local n, err = forceAll()
-	if n == 0 then
-		log("[BOOST] Errore: " .. tostring(err))
-		return
-	end
-	log("[BOOST] Pet Walkspeed impostato a 10000")
-	if holding then
-		return
-	end
-	holding = true
-	holdConn = RunService.Heartbeat:Connect(function()
-		if not alive or not holding then
-			return
-		end
-		forceAll()
+	local item = targets[1]
+	local up = item.originalUpgrades
+	local before = readField(up, "Pet Walkspeed")
+	local wrote = pcall(function()
+		up["Pet Walkspeed"] = 10000
 	end)
+	local after = readField(up, "Pet Walkspeed")
+	if wrote and after == 10000 then
+		item.mode = "direct"
+		log(string.format("[BOOST] Pet Walkspeed %s -> 10000", tostring(before)))
+		return
+	end
+	if typeof(setupvalue) ~= "function" then
+		log("[BOOST] Errore: letto " .. tostring(after))
+		return
+	end
+	local installed
+	local err
+	if item.kind == "parent" and typeof(item.parent) == "table" then
+		local parentCopy = copyMap(item.parent)
+		local upCopy = copyMap(up)
+		upCopy["Pet Walkspeed"] = 10000
+		parentCopy.Upgrades = upCopy
+		local ok
+		ok, err = pcall(setupvalue, item.fn, item.index, parentCopy)
+		local _, now = upvalueAt(item.fn, item.index)
+		local nowUp = typeof(now) == "table" and readField(now, "Upgrades")
+		local nowLevel = typeof(nowUp) == "table" and readField(nowUp, "Pet Walkspeed")
+		if ok and nowLevel == 10000 then
+			item.mode = "setup"
+			item.backup = item.parent
+			item.realUpgrades = upCopy
+			installed = true
+		end
+	else
+		local upCopy = copyMap(up)
+		upCopy["Pet Walkspeed"] = 10000
+		local ok
+		ok, err = pcall(setupvalue, item.fn, item.index, upCopy)
+		local _, now = upvalueAt(item.fn, item.index)
+		local nowLevel = typeof(now) == "table" and readField(now, "Pet Walkspeed")
+		if ok and nowLevel == 10000 then
+			item.mode = "setup"
+			item.backup = up
+			item.realUpgrades = upCopy
+			installed = true
+		end
+	end
+	if installed then
+		log(string.format("[BOOST] Pet Walkspeed %s -> 10000", tostring(before)))
+		return
+	end
+	log("[BOOST] Errore: " .. tostring(err or after))
 end
 
 local function shutdown()
