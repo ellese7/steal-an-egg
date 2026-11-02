@@ -81,7 +81,6 @@ local setupvalue = api("setupvalue")
 local getconstants = api("getconstants")
 local getproto = api("getproto")
 local getprotos = api("getprotos")
-local setclip = api("setclipboard") or api("toclipboard") or api("setrbxclipboard")
 
 local function cut(text, n)
 	text = tostring(text or "")
@@ -599,7 +598,7 @@ end
 
 local function spyStart()
 	local box = spyBox()
-	if namecallReady or box.ready then
+	if (namecallReady or box.ready) and typeof(box.real) == "function" and typeof(box.detour) == "function" then
 		namecallReady = true
 		setSpy(true)
 		log("[REMOTE] spy attivo")
@@ -715,10 +714,30 @@ local function logFire(self, ...)
 		log("[ERR] namecall non sostituito")
 		return
 	end
+	box.real = original
+	box.mt = mt
+	box.detour = detour
 	box.ready = true
 	namecallReady = true
 	setSpy(true)
 	log("[REMOTE] spy attivo")
+end
+
+local function setNamecall(fn)
+	local box = spyBox()
+	if typeof(box.mt) ~= "table" or typeof(fn) ~= "function" then
+		return
+	end
+	local setreadonly = api("setreadonly")
+	if typeof(setreadonly) == "function" then
+		pcall(setreadonly, box.mt, false)
+	end
+	pcall(function()
+		box.mt.__namecall = fn
+	end)
+	if typeof(setreadonly) == "function" then
+		pcall(setreadonly, box.mt, true)
+	end
 end
 
 local function spyStop()
@@ -877,24 +896,6 @@ local function clipBuckets()
 	return buckets
 end
 
-local function clipFns()
-	local out, seen = {}, {}
-	local names = { "setclipboard", "toclipboard", "setrbxclipboard" }
-	local buckets = clipBuckets()
-	for i = 1, #buckets do
-		for n = 1, #names do
-			local ok, fn = pcall(function()
-				return buckets[i][names[n]]
-			end)
-			if ok and typeof(fn) == "function" and not seen[fn] then
-				seen[fn] = true
-				out[#out + 1] = fn
-			end
-		end
-	end
-	return out
-end
-
 local function clipRead()
 	local buckets = clipBuckets()
 	for i = 1, #buckets do
@@ -929,54 +930,63 @@ copyBtn.MouseButton1Click:Connect(function()
 		log("[COPY] log vuoto")
 		return
 	end
-	local function writeBackup()
-		local ok = pcall(writefile, "psx_delta_log.txt", text)
-		return ok
+	local box = spyBox()
+	local paused = false
+	if typeof(box.real) == "function" then
+		setNamecall(box.real)
+		paused = true
 	end
-	local fns = clipFns()
-	local verified = false
-	local called = false
-	for i = 1, #fns do
-		local ok = pcall(fns[i], text)
-		if ok then
-			called = true
-			local got = clipRead()
-			if got == nil or clipMatches(got, text) then
-				if got ~= nil then
-					verified = true
-				end
-				break
+	local function resume()
+		if paused and typeof(box.detour) == "function" then
+			setNamecall(box.detour)
+			paused = false
+		end
+	end
+	local function envFn(name)
+		local fn
+		pcall(function()
+			if typeof(getgenv) == "function" then
+				fn = getgenv()[name]
+			end
+		end)
+		if typeof(fn) == "function" then
+			return fn
+		end
+		local globalFn = rawget(_G, name)
+		if typeof(globalFn) == "function" then
+			return globalFn
+		end
+		return nil
+	end
+	local okCopy, errCopy = pcall(function()
+		local clipFn = envFn("setclipboard") or envFn("toclipboard")
+		if typeof(clipFn) == "function" then
+			pcall(clipFn, text)
+		end
+		local clipOk = clipMatches(clipRead(), text)
+		local fileOk = false
+		local writeFn = envFn("writefile")
+		local readFn = envFn("readfile")
+		if typeof(writeFn) == "function" and typeof(readFn) == "function" then
+			local wrote = pcall(writeFn, "psx_delta_log.txt", text)
+			if wrote then
+				local ok, back = pcall(readFn, "psx_delta_log.txt")
+				fileOk = ok and back == text
 			end
 		end
-	end
-	if verified then
-		log("[COPY] " .. tostring(rows) .. " righe")
-		return
-	end
-	task.spawn(function()
-		task.wait(0.1)
-		for i = 1, #fns do
-			pcall(fns[i], text)
-		end
-		task.wait(0.1)
-		local got = clipRead()
-		if clipMatches(got, text) then
-			log("[COPY] " .. tostring(rows) .. " righe")
-			return
-		end
-		local wrote = writeBackup()
-		if got == nil and called and wrote then
-			log("[COPY] " .. tostring(rows) .. " righe | psx_delta_log.txt")
-			return
-		end
-		if wrote then
-			log("[ERR] clipboard vuota | file psx_delta_log.txt (" .. tostring(rows) .. " righe)")
-		elseif called then
-			log("[ERR] clipboard vuota")
+		resume()
+		if clipOk then
+			log("[COPY] " .. tostring(rows) .. " righe negli appunti")
+		elseif fileOk then
+			log("[COPY] " .. tostring(rows) .. " righe in psx_delta_log.txt")
 		else
-			log("[ERR] setclipboard assente")
+			log("[ERR] copia non riuscita")
 		end
 	end)
+	resume()
+	if not okCopy and alive then
+		log("[ERR] " .. tostring(errCopy))
+	end
 end)
 
 boostBtn.MouseButton1Click:Connect(function()
