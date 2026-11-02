@@ -46,7 +46,8 @@ end
 local alive = true
 local scanning = false
 local logs = {}
-local logBox
+local logScroll
+local logRows = {}
 local targets = {}
 local holdConn
 local holding = false
@@ -92,17 +93,44 @@ end
 
 local function pushLog(line)
 	logs[#logs + 1] = line
-	if #logs > 400 then
-		table.remove(logs, 1)
-	end
 	print(line)
-	if logBox then
-		local from = math.max(1, #logs - 40)
-		local shown = {}
-		for i = from, #logs do
-			shown[#shown + 1] = logs[i]
+end
+
+local function flushLogs()
+	if not alive or not logScroll or not logScroll.Parent then
+		return
+	end
+	while #logs > 2000 do
+		table.remove(logs, 1)
+		local old = table.remove(logRows, 1)
+		if old then
+			old:Destroy()
 		end
-		logBox.Text = table.concat(shown, "\n")
+	end
+	local added = false
+	while #logRows < #logs do
+		local row = Instance.new("TextLabel")
+		row.BackgroundTransparency = 1
+		row.Size = UDim2.new(1, -10, 0, 0)
+		row.AutomaticSize = Enum.AutomaticSize.Y
+		row.Font = Enum.Font.Code
+		row.TextSize = 13
+		row.TextColor3 = Color3.fromRGB(210, 216, 200)
+		row.TextXAlignment = Enum.TextXAlignment.Left
+		row.TextYAlignment = Enum.TextYAlignment.Top
+		row.TextWrapped = true
+		row.Text = logs[#logRows + 1]
+		row.LayoutOrder = #logRows + 1
+		row.Parent = logScroll
+		logRows[#logRows + 1] = row
+		added = true
+	end
+	if added then
+		task.defer(function()
+			if logScroll then
+				logScroll.CanvasPosition = Vector2.new(0, logScroll.AbsoluteCanvasSize.Y)
+			end
+		end)
 	end
 end
 
@@ -724,7 +752,7 @@ gui.IgnoreGuiInset = true
 gui.Parent = pg
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(520, 310)
+frame.Size = UDim2.fromOffset(640, 460)
 frame.Position = UDim2.fromOffset(12, 12)
 frame.BackgroundColor3 = Color3.fromRGB(20, 24, 30)
 frame.BackgroundTransparency = 0.08
@@ -759,21 +787,25 @@ local boostBtn = button("APPLICA BOOST", 292, 150, Color3.fromRGB(140, 90, 20))
 local scanBtn = button("SCAN REMOTES", 8, 150, Color3.fromRGB(70, 70, 110))
 scanBtn.Position = UDim2.fromOffset(8, 40)
 
-logBox = Instance.new("TextBox")
-logBox.Size = UDim2.new(1, -16, 1, -80)
-logBox.Position = UDim2.fromOffset(8, 74)
-logBox.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
-logBox.TextColor3 = Color3.fromRGB(210, 216, 200)
-logBox.TextSize = 13
-logBox.Font = Enum.Font.Code
-logBox.Text = "START cerca la funzione. APPLICA BOOST scrive 10000."
-logBox.TextXAlignment = Enum.TextXAlignment.Left
-logBox.TextYAlignment = Enum.TextYAlignment.Top
-logBox.TextWrapped = true
-logBox.ClearTextOnFocus = false
-logBox.TextEditable = false
-logBox.MultiLine = true
-logBox.Parent = frame
+logScroll = Instance.new("ScrollingFrame")
+logScroll.Size = UDim2.new(1, -16, 1, -82)
+logScroll.Position = UDim2.fromOffset(8, 74)
+logScroll.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
+logScroll.BorderSizePixel = 0
+logScroll.ScrollBarThickness = 8
+logScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+logScroll.CanvasSize = UDim2.new()
+logScroll.Parent = frame
+local logLayout = Instance.new("UIListLayout")
+logLayout.SortOrder = Enum.SortOrder.LayoutOrder
+logLayout.Padding = UDim.new(0, 2)
+logLayout.Parent = logScroll
+local logPad = Instance.new("UIPadding")
+logPad.PaddingTop = UDim.new(0, 4)
+logPad.PaddingLeft = UDim.new(0, 4)
+logPad.PaddingRight = UDim.new(0, 4)
+logPad.Parent = logScroll
+RunService.Heartbeat:Connect(flushLogs)
 
 startBtn.MouseButton1Click:Connect(function()
 	if not alive then
@@ -807,23 +839,117 @@ stopBtn.MouseButton1Click:Connect(function()
 	end
 end)
 
+local function clipBuckets()
+	local buckets = {}
+	pcall(function()
+		if typeof(getgenv) == "function" then
+			buckets[#buckets + 1] = getgenv()
+		end
+	end)
+	buckets[#buckets + 1] = _G
+	return buckets
+end
+
+local function clipFns()
+	local out, seen = {}, {}
+	local names = { "setclipboard", "toclipboard", "setrbxclipboard" }
+	local buckets = clipBuckets()
+	for i = 1, #buckets do
+		for n = 1, #names do
+			local ok, fn = pcall(function()
+				return buckets[i][names[n]]
+			end)
+			if ok and typeof(fn) == "function" and not seen[fn] then
+				seen[fn] = true
+				out[#out + 1] = fn
+			end
+		end
+	end
+	return out
+end
+
+local function clipRead()
+	local buckets = clipBuckets()
+	for i = 1, #buckets do
+		local ok, fn = pcall(function()
+			return buckets[i].getclipboard
+		end)
+		if ok and typeof(fn) == "function" then
+			local ok2, got = pcall(fn)
+			if ok2 and typeof(got) == "string" then
+				return got
+			end
+		end
+	end
+	return nil
+end
+
+local function clipMatches(got, text)
+	if typeof(got) ~= "string" or got == "" then
+		return false
+	end
+	if got == text then
+		return true
+	end
+	return string.gsub(got, "\r\n", "\n") == text
+end
+
 copyBtn.MouseButton1Click:Connect(function()
 	setSpy(false)
 	local text = table.concat(logs, "\n")
+	local rows = #logs
 	if text == "" then
 		log("[COPY] log vuoto")
 		return
 	end
-	if typeof(setclip) ~= "function" then
-		log("[ERR] setclipboard assente")
+	local function writeBackup()
+		local ok = pcall(writefile, "psx_delta_log.txt", text)
+		return ok
+	end
+	local fns = clipFns()
+	local verified = false
+	local called = false
+	for i = 1, #fns do
+		local ok = pcall(fns[i], text)
+		if ok then
+			called = true
+			local got = clipRead()
+			if got == nil or clipMatches(got, text) then
+				if got ~= nil then
+					verified = true
+				end
+				break
+			end
+		end
+	end
+	if verified then
+		log("[COPY] " .. tostring(rows) .. " righe")
 		return
 	end
-	local ok, err = pcall(setclip, text)
-	if ok then
-		log("[COPY] " .. tostring(#logs) .. " righe")
-	else
-		log("[ERR] setclipboard " .. tostring(err))
-	end
+	task.spawn(function()
+		task.wait(0.1)
+		for i = 1, #fns do
+			pcall(fns[i], text)
+		end
+		task.wait(0.1)
+		local got = clipRead()
+		if clipMatches(got, text) then
+			log("[COPY] " .. tostring(rows) .. " righe")
+			return
+		end
+		local wrote = writeBackup()
+		if got == nil and called and wrote then
+			log("[COPY] " .. tostring(rows) .. " righe | psx_delta_log.txt")
+			return
+		end
+		if wrote then
+			log("[ERR] clipboard vuota | file psx_delta_log.txt (" .. tostring(rows) .. " righe)")
+		elseif called then
+			log("[ERR] clipboard vuota")
+		else
+			log("[ERR] setclipboard assente")
+		end
+	end)
 end)
 
 boostBtn.MouseButton1Click:Connect(function()
