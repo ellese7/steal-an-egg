@@ -633,46 +633,89 @@ local function spyStart()
 		log("[ERR] newcclosure perde gli upvalue, hook non installato")
 		return
 	end
-local lastCoinId
-local function describeCoin(raw)
+local seenAttr = {}
+local pendingId
+local pendingName
+local pendingAttrs
+local pendingPets = {}
+local flushScheduled = false
+
+local function findCoin(raw)
 	local id = tostring(raw)
 	local things = workspace:FindFirstChild("__THINGS")
 	local folder = things and things:FindFirstChild("Coins")
 	if not folder then
-		return "cartella Coins assente"
+		return nil
 	end
 	local kids = folder:GetChildren()
 	for i = 1, #kids do
 		local coin = kids[i]
-		local name = coin:GetAttribute("Name")
-		local area = coin:GetAttribute("Area")
-		local label = tostring(name) .. " Area=" .. tostring(area) .. " child=" .. coin.Name
 		if coin.Name == id then
-			return label .. " via child.Name"
-		end
-		local attrs = coin:GetAttributes()
-		for key, value in pairs(attrs) do
-			if tostring(value) == id then
-				return label .. " via attr." .. tostring(key)
-			end
+			return coin
 		end
 	end
-	return "id assente in Coins"
+	return nil
+end
+
+local function attrDump(coin)
+	local parts = {}
+	local attrs = coin:GetAttributes()
+	for key, value in pairs(attrs) do
+		parts[#parts + 1] = tostring(key) .. "=" .. tostring(value)
+	end
+	table.sort(parts)
+	return table.concat(parts, ", ")
+end
+
+local function flushBreak()
+	flushScheduled = false
+	if not pendingId then
+		return
+	end
+	log(string.format("[BREAK] %s | id=%s | pet=%d | %s", pendingName, pendingId, #pendingPets, table.concat(pendingPets, ", ")))
+	if pendingAttrs then
+		log("[ATTR] " .. pendingId .. " | " .. pendingAttrs)
+		pendingAttrs = nil
+	end
+	pendingPets = {}
+	pendingId = nil
+	pendingName = nil
 end
 
 local function logFire(self, ...)
 		local path = self:GetFullName()
 		local packed = { ... }
+		if packed[2] == "Coin" and packed[3] ~= nil then
+			local id = tostring(packed[3])
+			if pendingId ~= id then
+				if pendingId then
+					flushBreak()
+				end
+				pendingId = id
+				local coin = findCoin(id)
+				if coin then
+					pendingName = tostring(coin:GetAttribute("Name"))
+					if not seenAttr[id] then
+						seenAttr[id] = true
+						pendingAttrs = attrDump(coin)
+					end
+				else
+					pendingName = "nome assente"
+				end
+			end
+			pendingPets[#pendingPets + 1] = tostring(packed[1])
+			if not flushScheduled then
+				flushScheduled = true
+				task.delay(0.2, flushBreak)
+			end
+			return
+		end
 		local shown = {}
 		for i = 1, #packed do
 			shown[i] = dumpValue(packed[i], 0)
 		end
 		local args = table.concat(shown, ", ")
 		if textHits(path .. " " .. args) then
-			if packed[2] == "Coin" and packed[3] ~= nil and tostring(packed[3]) ~= lastCoinId then
-				lastCoinId = tostring(packed[3])
-				log("[COIN] " .. lastCoinId .. " | " .. describeCoin(packed[3]))
-			end
 			log("[REMOTE] " .. path .. " | Args: " .. args)
 		end
 	end
