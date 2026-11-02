@@ -576,6 +576,33 @@ local function isLuaFn(fn)
 	return ok and typeof(src) == "string" and src ~= "=[C]" and src ~= "[C]"
 end
 
+local function recoverEngine(fn, guard)
+	if typeof(fn) ~= "function" or isLuaFn(fn) then
+		return nil
+	end
+	guard = guard or {}
+	if guard[fn] then
+		return nil
+	end
+	guard[fn] = true
+	for i = 1, 40 do
+		local name, val, aliveUp = upvalueAt(fn, i)
+		if not aliveUp then
+			break
+		end
+		if (name == "original" or name == "old") and typeof(val) == "function" and not isLuaFn(val) then
+			if upvalueCount(val) == 0 then
+				return val
+			end
+			local deeper = recoverEngine(val, guard)
+			if typeof(deeper) == "function" then
+				return deeper
+			end
+		end
+	end
+	return nil
+end
+
 local function spyBox()
 	local box = env.__DeltaNamecallSpy
 	if typeof(box) ~= "table" then
@@ -588,6 +615,30 @@ end
 local function setSpy(flag)
 	spyOn = flag
 	spyBox().on = flag
+end
+
+local function ensureEngine()
+	local box = spyBox()
+	if typeof(box.engine) == "function" and not isLuaFn(box.engine) then
+		return box.engine
+	end
+	local current, mt = namecallNow()
+	if typeof(mt) == "table" then
+		box.mt = mt
+	end
+	if typeof(current) ~= "function" or isLuaFn(current) then
+		return nil
+	end
+	local recovered = recoverEngine(current)
+	if typeof(recovered) == "function" then
+		box.engine = recovered
+		return recovered
+	end
+	if typeof(box.detour) == "function" and current == box.detour then
+		return nil
+	end
+	box.engine = current
+	return current
 end
 
 local function spyStart()
@@ -605,13 +656,19 @@ local function spyStart()
 		log("[ERR] getnamecallmethod o newcclosure assente")
 		return
 	end
-	local original, mt = namecallNow()
-	if typeof(original) ~= "function" or typeof(mt) ~= "table" then
+	local current, mt = namecallNow()
+	if typeof(current) ~= "function" or typeof(mt) ~= "table" then
 		log("[ERR] namecall originale assente. Rientra nel gioco.")
 		return
 	end
-	if isLuaFn(original) then
+	if isLuaFn(current) then
 		log("[ERR] namecall gia' rotto. Chiudi il gioco, rientra, poi riesegui.")
+		return
+	end
+	box.mt = mt
+	local original = ensureEngine()
+	if typeof(original) ~= "function" then
+		log("[ERR] namecall impilato. Chiudi il gioco, rientra, poi riesegui.")
 		return
 	end
 	local token = {}
@@ -905,41 +962,49 @@ stopBtn.MouseButton1Click:Connect(function()
 	end
 end)
 
-local function clipBuckets()
-	local buckets = {}
-	pcall(function()
-		if typeof(getgenv) == "function" then
-			buckets[#buckets + 1] = getgenv()
-		end
-	end)
-	buckets[#buckets + 1] = _G
-	return buckets
-end
-
-local function clipRead()
-	local buckets = clipBuckets()
-	for i = 1, #buckets do
-		local ok, fn = pcall(function()
-			return buckets[i].getclipboard
-		end)
-		if ok and typeof(fn) == "function" then
-			local ok2, got = pcall(fn)
-			if ok2 and typeof(got) == "string" then
-				return got
-			end
-		end
-	end
-	return nil
-end
-
 local function clipMatches(got, text)
-	if typeof(got) ~= "string" or got == "" then
+	if typeof(got) ~= "string" or got == "" or typeof(text) ~= "string" or text == "" then
 		return false
 	end
-	if got == text then
+	local function norm(s)
+		s = string.gsub(s, "\r\n", "\n")
+		return string.gsub(s, "\r", "\n")
+	end
+	local a = norm(got)
+	local b = norm(text)
+	if a == b then
 		return true
 	end
-	return string.gsub(got, "\r\n", "\n") == text
+	return string.sub(a, -1) == "\n" and string.sub(a, 1, -2) == b
+end
+
+local function envFn(name)
+	local luaFn
+	local function consider(fn)
+		if typeof(fn) ~= "function" then
+			return nil
+		end
+		if not isLuaFn(fn) then
+			return fn
+		end
+		if luaFn == nil then
+			luaFn = fn
+		end
+		return nil
+	end
+	local picked
+	pcall(function()
+		if typeof(getgenv) == "function" then
+			picked = consider(getgenv()[name])
+		end
+	end)
+	if typeof(picked) ~= "function" then
+		picked = consider(rawget(_G, name))
+	end
+	if typeof(picked) == "function" then
+		return picked
+	end
+	return luaFn
 end
 
 copyBtn.MouseButton1Click:Connect(function()
@@ -951,63 +1016,65 @@ copyBtn.MouseButton1Click:Connect(function()
 		return
 	end
 	local box = spyBox()
-	local writeFn = rawget(_G, "writefile")
-	local readFn = rawget(_G, "readfile")
-	pcall(function()
-		if typeof(getgenv) == "function" then
-			local g = getgenv()
-			if typeof(g.writefile) == "function" then
-				writeFn = g.writefile
-			end
-			if typeof(g.readfile) == "function" then
-				readFn = g.readfile
-			end
-		end
-	end)
-	local fileOk = false
-	if typeof(writeFn) == "function" and typeof(readFn) == "function" then
-		local wrote = pcall(writeFn, "psx_delta_log.txt", text)
-		if wrote then
-			local ok, back = pcall(readFn, "psx_delta_log.txt")
-			fileOk = ok and back == text
+	local engine = ensureEngine()
+	if typeof(engine) ~= "function" then
+		log("[ERR] namecall impilato. Chiudi il gioco, rientra, poi COPIA LOG.")
+		return
+	end
+	setNamecall(engine)
+	local clipFn = envFn("setclipboard") or envFn("toclipboard") or envFn("setrbxclipboard")
+	local readFn = envFn("getclipboard")
+	local callOk, callErr = false, "assente"
+	if typeof(clipFn) == "function" then
+		callOk, callErr = pcall(clipFn, text)
+	end
+	local got
+	local readOk = false
+	if typeof(readFn) == "function" then
+		local okRead, value = pcall(readFn)
+		readOk = okRead and typeof(value) == "string"
+		if readOk then
+			got = value
 		end
 	end
-	task.spawn(function()
-		box.copying = true
-		local fn = setclipboard
-		if typeof(fn) ~= "function" then
-			fn = toclipboard
+	if typeof(box.detour) == "function" then
+		setNamecall(box.detour)
+	end
+	local writeFn = envFn("writefile")
+	local fileRead = envFn("readfile")
+	local fileOk = false
+	if typeof(writeFn) == "function" and typeof(fileRead) == "function" then
+		local wrote = pcall(writeFn, "psx_delta_log.txt", text)
+		if wrote then
+			local okBack, back = pcall(fileRead, "psx_delta_log.txt")
+			fileOk = okBack and back == text
 		end
-		if typeof(fn) ~= "function" and typeof(getgenv) == "function" then
-			local g = getgenv()
-			fn = g.setclipboard or g.toclipboard
-		end
-		if typeof(fn) ~= "function" then
-			box.copying = false
-			if fileOk then
-				log("[ERR] setclipboard assente | file psx_delta_log.txt (" .. tostring(rows) .. " righe)")
-			else
-				log("[ERR] setclipboard assente")
-			end
-			return
-		end
-		local ok, err = pcall(fn, text)
-		local got = clipRead()
-		box.copying = false
-		if ok and (got == nil or clipMatches(got, text)) then
-			log("[COPY] " .. tostring(rows) .. " righe negli appunti")
-			return
-		end
-		if not ok then
-			log("[ERR] setclipboard " .. tostring(err))
-			return
-		end
-		if fileOk then
-			log("[ERR] clipboard non aggiornata | file psx_delta_log.txt (" .. tostring(rows) .. " righe)")
-		else
-			log("[ERR] clipboard non aggiornata")
-		end
-	end)
+	end
+	if typeof(clipFn) ~= "function" then
+		log("[ERR] setclipboard assente")
+		return
+	end
+	if not callOk then
+		log("[ERR] setclipboard " .. tostring(callErr))
+		return
+	end
+	if typeof(readFn) ~= "function" then
+		log("[ERR] getclipboard assente, paste non verificato")
+		return
+	end
+	if not readOk then
+		log("[ERR] getclipboard non ha restituito il testo")
+		return
+	end
+	if clipMatches(got, text) then
+		log("[COPY] " .. tostring(rows) .. " righe negli appunti")
+		return
+	end
+	local where = ""
+	if fileOk then
+		where = " | testo in psx_delta_log.txt"
+	end
+	log("[ERR] clipboard non aggiornata (letti " .. tostring(#got) .. " su " .. tostring(#text) .. ")" .. where)
 end)
 
 boostBtn.MouseButton1Click:Connect(function()
