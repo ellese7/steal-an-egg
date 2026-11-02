@@ -634,7 +634,34 @@ local function spyStart()
 		log("[ERR] newcclosure perde gli upvalue, hook non installato")
 		return
 	end
-	local function logFire(self, ...)
+local lastCoinId
+local function describeCoin(raw)
+	local id = tostring(raw)
+	local things = workspace:FindFirstChild("__THINGS")
+	local folder = things and things:FindFirstChild("Coins")
+	if not folder then
+		return "cartella Coins assente"
+	end
+	local kids = folder:GetChildren()
+	for i = 1, #kids do
+		local coin = kids[i]
+		local name = coin:GetAttribute("Name")
+		local area = coin:GetAttribute("Area")
+		local label = tostring(name) .. " Area=" .. tostring(area) .. " child=" .. coin.Name
+		if coin.Name == id then
+			return label .. " via child.Name"
+		end
+		local attrs = coin:GetAttributes()
+		for key, value in pairs(attrs) do
+			if tostring(value) == id then
+				return label .. " via attr." .. tostring(key)
+			end
+		end
+	end
+	return "id assente in Coins"
+end
+
+local function logFire(self, ...)
 		local path = self:GetFullName()
 		local packed = { ... }
 		local shown = {}
@@ -643,6 +670,10 @@ local function spyStart()
 		end
 		local args = table.concat(shown, ", ")
 		if textHits(path .. " " .. args) then
+			if packed[2] == "Coin" and packed[3] ~= nil and tostring(packed[3]) ~= lastCoinId then
+				lastCoinId = tostring(packed[3])
+				log("[COIN] " .. lastCoinId .. " | " .. describeCoin(packed[3]))
+			end
 			log("[REMOTE] " .. path .. " | Args: " .. args)
 		end
 	end
@@ -705,7 +736,7 @@ local function scanRemotes()
 		if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") or inst:IsA("UnreliableRemoteEvent") then
 			total = total + 1
 			local path = inst:GetFullName()
-			if textHits(path) then
+			if textHits(path) or (inst.Parent == rs and string.match(inst.Name, "^%x+$") and #inst.Name >= 16) then
 				shown = shown + 1
 				local extra = ""
 				if typeof(getconnections) == "function" and inst:IsA("RemoteEvent") then
@@ -783,13 +814,11 @@ end
 local startBtn = button("START", 8, 84, Color3.fromRGB(50, 80, 120))
 local stopBtn = button("STOP", 98, 72, Color3.fromRGB(140, 50, 50))
 local copyBtn = button("COPIA LOG", 176, 110, Color3.fromRGB(40, 120, 50))
-local boostBtn = button("APPLICA BOOST", 292, 150, Color3.fromRGB(140, 90, 20))
-local scanBtn = button("SCAN REMOTES", 8, 150, Color3.fromRGB(70, 70, 110))
-scanBtn.Position = UDim2.fromOffset(8, 40)
+local boostBtn = button("BOOST SPEED", 292, 150, Color3.fromRGB(140, 90, 20))
 
 logScroll = Instance.new("ScrollingFrame")
-logScroll.Size = UDim2.new(1, -16, 1, -82)
-logScroll.Position = UDim2.fromOffset(8, 74)
+logScroll.Size = UDim2.new(1, -16, 1, -50)
+logScroll.Position = UDim2.fromOffset(8, 42)
 logScroll.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
 logScroll.BorderSizePixel = 0
 logScroll.ScrollBarThickness = 8
@@ -812,6 +841,12 @@ startBtn.MouseButton1Click:Connect(function()
 		return
 	end
 	task.spawn(spyStart)
+	task.spawn(function()
+		local ok, err = pcall(scanRemotes)
+		if not ok and alive then
+			log("[ERR] " .. tostring(err))
+		end
+	end)
 	if scanning then
 		return
 	end
@@ -960,18 +995,6 @@ boostBtn.MouseButton1Click:Connect(function()
 		local ok, err = pcall(applyBoost)
 		if not ok and alive then
 			log("[BOOST] Errore: " .. tostring(err))
-		end
-	end)
-end)
-
-scanBtn.MouseButton1Click:Connect(function()
-	if not alive then
-		return
-	end
-	task.spawn(function()
-		local ok, err = pcall(scanRemotes)
-		if not ok and alive then
-			log("[ERR] " .. tostring(err))
 		end
 	end)
 end)
