@@ -678,12 +678,14 @@ local function logFire(self, ...)
 		end
 	end
 	local detour = newcclosure(function(self, ...)
-		if box.on and not box.busy then
+		if box.on then
 			local method = getnamecallmethod()
-			if method == "FireServer" and typeof(self) == "Instance" then
-				box.busy = true
-				pcall(logFire, self, ...)
-				box.busy = false
+			if method == "FireServer" then
+				local argc = select("#", ...)
+				local packed = { ... }
+				task.defer(function()
+					pcall(logFire, self, unpack(packed, 1, argc))
+				end)
 			end
 		end
 		return original(self, ...)
@@ -736,20 +738,10 @@ local function scanRemotes()
 		if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") or inst:IsA("UnreliableRemoteEvent") then
 			total = total + 1
 			local path = inst:GetFullName()
-			if textHits(path) or (inst.Parent == rs and string.match(inst.Name, "^%x+$") and #inst.Name >= 16) then
+			if textHits(path) then
 				shown = shown + 1
-				local extra = ""
-				if typeof(getconnections) == "function" and inst:IsA("RemoteEvent") then
-					local ok, conns = pcall(getconnections, inst.OnClientEvent)
-					if ok and typeof(conns) == "table" then
-						local n = 0
-						for _ in pairs(conns) do
-							n = n + 1
-						end
-						extra = " | OnClientEvent=" .. tostring(n)
-					end
-				end
-				log("[REMOTE] scan " .. path .. extra)
+			elseif inst.Parent == rs and string.match(inst.Name, "^%x+$") and #inst.Name >= 16 then
+				shown = shown + 1
 			end
 		end
 		if i % 400 == 0 then
@@ -783,7 +775,7 @@ gui.IgnoreGuiInset = true
 gui.Parent = pg
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(640, 460)
+frame.Size = UDim2.fromOffset(460, 200)
 frame.Position = UDim2.fromOffset(12, 12)
 frame.BackgroundColor3 = Color3.fromRGB(20, 24, 30)
 frame.BackgroundTransparency = 0.08
@@ -817,8 +809,8 @@ local copyBtn = button("COPIA LOG", 176, 110, Color3.fromRGB(40, 120, 50))
 local boostBtn = button("BOOST SPEED", 292, 150, Color3.fromRGB(140, 90, 20))
 
 logScroll = Instance.new("ScrollingFrame")
-logScroll.Size = UDim2.new(1, -16, 1, -50)
-logScroll.Position = UDim2.fromOffset(8, 42)
+logScroll.Size = UDim2.new(1, -16, 1, -48)
+logScroll.Position = UDim2.fromOffset(8, 40)
 logScroll.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
 logScroll.BorderSizePixel = 0
 logScroll.ScrollBarThickness = 8
