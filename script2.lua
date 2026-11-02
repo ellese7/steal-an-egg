@@ -470,8 +470,145 @@ local function applyBoost()
 	end)
 end
 
+local spyOn = false
+local spyBusy = false
+local namecallReady = false
+local KEYS = { "pet", "coin", "chest", "breakable", "attack", "hit", "farm", "equip", "join" }
+
+local function textHits(text)
+	local low = string.lower(text)
+	for i = 1, #KEYS do
+		if string.find(low, KEYS[i], 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function dumpValue(value, depth)
+	if depth > 2 then
+		return "..."
+	end
+	local kind = typeof(value)
+	if kind == "string" then
+		local id = string.match(value, "^id[%x]+$")
+			or string.match(value, "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$")
+		if id or (#value >= 24 and string.match(value, "^[%x%-]+$")) then
+			return "[ID] " .. value
+		end
+		return string.format("%q", cut(value, 80))
+	end
+	if kind == "number" or kind == "boolean" then
+		return tostring(value)
+	end
+	if kind == "Instance" then
+		return value:GetFullName()
+	end
+	if kind == "table" then
+		local parts = {}
+		local n = 0
+		for k, v in pairs(value) do
+			n = n + 1
+			if n > 8 then
+				parts[#parts + 1] = "..."
+				break
+			end
+			parts[#parts + 1] = tostring(k) .. "=" .. dumpValue(v, depth + 1)
+		end
+		return "{" .. table.concat(parts, ", ") .. "}"
+	end
+	return kind
+end
+
+local function spyStart()
+	if namecallReady then
+		spyOn = true
+		log("[REMOTE] spy attivo")
+		return
+	end
+	local hookmetamethod = api("hookmetamethod")
+	local getnamecallmethod = api("getnamecallmethod")
+	if typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" then
+		log("[ERR] hookmetamethod assente")
+		return
+	end
+	local ok, err = pcall(function()
+		local old
+		old = hookmetamethod(game, "__namecall", function(self, ...)
+			if spyOn and not spyBusy and typeof(self) == "Instance" then
+				local method = getnamecallmethod()
+				if method == "FireServer" then
+					spyBusy = true
+					pcall(function()
+						local path = self:GetFullName()
+						local packed = { ... }
+						local shown = {}
+						for i = 1, #packed do
+							shown[i] = dumpValue(packed[i], 0)
+						end
+						local args = table.concat(shown, ", ")
+						if textHits(path .. " " .. args) then
+							log("[REMOTE] " .. path .. " | Args: " .. args)
+						end
+					end)
+					spyBusy = false
+				end
+			end
+			return old(self, ...)
+		end)
+	end)
+	if not ok then
+		log("[ERR] hook " .. tostring(err))
+		return
+	end
+	namecallReady = true
+	spyOn = true
+	log("[REMOTE] spy attivo")
+end
+
+local function spyStop()
+	if not spyOn then
+		return
+	end
+	spyOn = false
+	log("[REMOTE] spy spento")
+end
+
+local function scanRemotes()
+	local rs = game:GetService("ReplicatedStorage")
+	local list = rs:GetDescendants()
+	local total, shown = 0, 0
+	for i = 1, #list do
+		local inst = list[i]
+		if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") or inst:IsA("UnreliableRemoteEvent") then
+			total = total + 1
+			local path = inst:GetFullName()
+			if textHits(path) then
+				shown = shown + 1
+				local extra = ""
+				if typeof(getconnections) == "function" and inst:IsA("RemoteEvent") then
+					local ok, conns = pcall(getconnections, inst.OnClientEvent)
+					if ok and typeof(conns) == "table" then
+						local n = 0
+						for _ in pairs(conns) do
+							n = n + 1
+						end
+						extra = " | OnClientEvent=" .. tostring(n)
+					end
+				end
+				log("[REMOTE] scan " .. path .. extra)
+			end
+		end
+		if i % 400 == 0 then
+			task.wait()
+		end
+	end
+	log(string.format("[REMOTE] scan remoti=%d sospetti=%d", total, shown))
+end
+
 local function shutdown()
 	alive = false
+	spyOn = false
 	restore()
 	pcall(function()
 		gui:Destroy()
@@ -493,7 +630,7 @@ gui.IgnoreGuiInset = true
 gui.Parent = pg
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(520, 280)
+frame.Size = UDim2.fromOffset(520, 310)
 frame.Position = UDim2.fromOffset(12, 12)
 frame.BackgroundColor3 = Color3.fromRGB(20, 24, 30)
 frame.BackgroundTransparency = 0.08
@@ -525,10 +662,12 @@ local startBtn = button("START", 8, 84, Color3.fromRGB(50, 80, 120))
 local stopBtn = button("STOP", 98, 72, Color3.fromRGB(140, 50, 50))
 local copyBtn = button("COPIA LOG", 176, 110, Color3.fromRGB(40, 120, 50))
 local boostBtn = button("APPLICA BOOST", 292, 150, Color3.fromRGB(140, 90, 20))
+local scanBtn = button("SCAN REMOTES", 8, 150, Color3.fromRGB(70, 70, 110))
+scanBtn.Position = UDim2.fromOffset(8, 40)
 
 logBox = Instance.new("TextBox")
-logBox.Size = UDim2.new(1, -16, 1, -48)
-logBox.Position = UDim2.fromOffset(8, 42)
+logBox.Size = UDim2.new(1, -16, 1, -80)
+logBox.Position = UDim2.fromOffset(8, 74)
 logBox.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
 logBox.TextColor3 = Color3.fromRGB(210, 216, 200)
 logBox.TextSize = 13
@@ -543,7 +682,11 @@ logBox.MultiLine = true
 logBox.Parent = frame
 
 startBtn.MouseButton1Click:Connect(function()
-	if not alive or scanning then
+	if not alive then
+		return
+	end
+	task.spawn(spyStart)
+	if scanning then
 		return
 	end
 	scanning = true
@@ -561,6 +704,7 @@ stopBtn.MouseButton1Click:Connect(function()
 		return
 	end
 	local had = #targets
+	spyStop()
 	restore()
 	if had > 0 then
 		log("[STOP] Pet Walkspeed ripristinato")
@@ -570,6 +714,7 @@ stopBtn.MouseButton1Click:Connect(function()
 end)
 
 copyBtn.MouseButton1Click:Connect(function()
+	spyOn = false
 	local text = table.concat(logs, "\n")
 	if text == "" then
 		log("[COPY] log vuoto")
@@ -595,6 +740,18 @@ boostBtn.MouseButton1Click:Connect(function()
 		local ok, err = pcall(applyBoost)
 		if not ok and alive then
 			log("[BOOST] Errore: " .. tostring(err))
+		end
+	end)
+end)
+
+scanBtn.MouseButton1Click:Connect(function()
+	if not alive then
+		return
+	end
+	task.spawn(function()
+		local ok, err = pcall(scanRemotes)
+		if not ok and alive then
+			log("[ERR] " .. tostring(err))
 		end
 	end)
 end)
