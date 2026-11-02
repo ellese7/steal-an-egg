@@ -647,6 +647,9 @@ local function logFire(self, ...)
 	end
 	local counts = {}
 	local detour = newcclosure(function(self, ...)
+		if box.copying then
+			return original(self, ...)
+		end
 		local method
 		if box.on and not box.busy then
 			method = getnamecallmethod()
@@ -948,62 +951,63 @@ copyBtn.MouseButton1Click:Connect(function()
 		return
 	end
 	local box = spyBox()
-	local paused = false
-	if typeof(box.real) == "function" then
-		setNamecall(box.real)
-		paused = true
-	end
-	local function resume()
-		if paused and typeof(box.detour) == "function" then
-			setNamecall(box.detour)
-			paused = false
-		end
-	end
-	local function envFn(name)
-		local fn
-		pcall(function()
-			if typeof(getgenv) == "function" then
-				fn = getgenv()[name]
+	local writeFn = rawget(_G, "writefile")
+	local readFn = rawget(_G, "readfile")
+	pcall(function()
+		if typeof(getgenv) == "function" then
+			local g = getgenv()
+			if typeof(g.writefile) == "function" then
+				writeFn = g.writefile
 			end
-		end)
-		if typeof(fn) == "function" then
-			return fn
-		end
-		local globalFn = rawget(_G, name)
-		if typeof(globalFn) == "function" then
-			return globalFn
-		end
-		return nil
-	end
-	local okCopy, errCopy = pcall(function()
-		local clipFn = envFn("setclipboard") or envFn("toclipboard")
-		if typeof(clipFn) == "function" then
-			pcall(clipFn, text)
-		end
-		local clipOk = clipMatches(clipRead(), text)
-		local fileOk = false
-		local writeFn = envFn("writefile")
-		local readFn = envFn("readfile")
-		if typeof(writeFn) == "function" and typeof(readFn) == "function" then
-			local wrote = pcall(writeFn, "psx_delta_log.txt", text)
-			if wrote then
-				local ok, back = pcall(readFn, "psx_delta_log.txt")
-				fileOk = ok and back == text
+			if typeof(g.readfile) == "function" then
+				readFn = g.readfile
 			end
-		end
-		resume()
-		if clipOk then
-			log("[COPY] " .. tostring(rows) .. " righe negli appunti")
-		elseif fileOk then
-			log("[COPY] " .. tostring(rows) .. " righe in psx_delta_log.txt")
-		else
-			log("[ERR] copia non riuscita")
 		end
 	end)
-	resume()
-	if not okCopy and alive then
-		log("[ERR] " .. tostring(errCopy))
+	local fileOk = false
+	if typeof(writeFn) == "function" and typeof(readFn) == "function" then
+		local wrote = pcall(writeFn, "psx_delta_log.txt", text)
+		if wrote then
+			local ok, back = pcall(readFn, "psx_delta_log.txt")
+			fileOk = ok and back == text
+		end
 	end
+	task.spawn(function()
+		box.copying = true
+		local fn = setclipboard
+		if typeof(fn) ~= "function" then
+			fn = toclipboard
+		end
+		if typeof(fn) ~= "function" and typeof(getgenv) == "function" then
+			local g = getgenv()
+			fn = g.setclipboard or g.toclipboard
+		end
+		if typeof(fn) ~= "function" then
+			box.copying = false
+			if fileOk then
+				log("[ERR] setclipboard assente | file psx_delta_log.txt (" .. tostring(rows) .. " righe)")
+			else
+				log("[ERR] setclipboard assente")
+			end
+			return
+		end
+		local ok, err = pcall(fn, text)
+		local got = clipRead()
+		box.copying = false
+		if ok and (got == nil or clipMatches(got, text)) then
+			log("[COPY] " .. tostring(rows) .. " righe negli appunti")
+			return
+		end
+		if not ok then
+			log("[ERR] setclipboard " .. tostring(err))
+			return
+		end
+		if fileOk then
+			log("[ERR] clipboard non aggiornata | file psx_delta_log.txt (" .. tostring(rows) .. " righe)")
+		else
+			log("[ERR] clipboard non aggiornata")
+		end
+	end)
 end)
 
 boostBtn.MouseButton1Click:Connect(function()
