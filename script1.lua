@@ -2,6 +2,33 @@
 -- getconnections, getgc, debug.getupvalue, debug.setupvalue.
 -- v113 non viene sostituito. Si fissa la tabella Upgrades che la funzione legge.
 
+local function namecallNow()
+	local grm = getrawmetatable
+	if type(grm) ~= "function" and type(getgenv) == "function" then
+		grm = getgenv().getrawmetatable
+	end
+	if type(grm) ~= "function" then
+		return nil
+	end
+	local ok, mt = pcall(grm, game)
+	if not ok or type(mt) ~= "table" then
+		return nil
+	end
+	return rawget(mt, "__namecall"), mt
+end
+
+do
+	local nc = namecallNow()
+	local info = debug and debug.info
+	if type(nc) == "function" and type(info) == "function" then
+		local ok, src = pcall(info, nc, "s")
+		if ok and type(src) == "string" and src ~= "=[C]" and src ~= "[C]" then
+			print("[ERR] namecall gia' rotto. Chiudi il gioco, rientra, poi riesegui.")
+			return
+		end
+	end
+end
+
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
@@ -550,71 +577,81 @@ local function spyStart()
 		log("[REMOTE] spy attivo")
 		return
 	end
-	local hookmetamethod = api("hookmetamethod")
 	local getnamecallmethod = api("getnamecallmethod")
 	local newcclosure = api("newcclosure")
-	local getrawmetatable = api("getrawmetatable")
-	if typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" or typeof(newcclosure) ~= "function" then
-		log("[ERR] hookmetamethod o newcclosure assente")
+	local setreadonly = api("setreadonly")
+	if typeof(getnamecallmethod) ~= "function" or typeof(newcclosure) ~= "function" then
+		log("[ERR] getnamecallmethod o newcclosure assente")
 		return
 	end
-	local original
-	if typeof(getrawmetatable) == "function" then
-		local ok, mt = pcall(getrawmetatable, game)
-		if ok and typeof(mt) == "table" then
-			original = mt.__namecall
+	local original, mt = namecallNow()
+	if typeof(original) ~= "function" or typeof(mt) ~= "table" then
+		log("[ERR] namecall originale assente. Rientra nel gioco.")
+		return
+	end
+	if isLuaFn(original) then
+		log("[ERR] namecall gia' rotto. Chiudi il gioco, rientra, poi riesegui.")
+		return
+	end
+	local token = {}
+	local probe = newcclosure(function()
+		return token
+	end)
+	if typeof(probe) ~= "function" then
+		log("[ERR] newcclosure non ha restituito una funzione")
+		return
+	end
+	local probeOk, probeGot = pcall(probe)
+	if not probeOk or probeGot ~= token then
+		log("[ERR] newcclosure perde gli upvalue, hook non installato")
+		return
+	end
+	local function logFire(self, ...)
+		local path = self:GetFullName()
+		local packed = { ... }
+		local shown = {}
+		for i = 1, #packed do
+			shown[i] = dumpValue(packed[i], 0)
+		end
+		local args = table.concat(shown, ", ")
+		if textHits(path .. " " .. args) then
+			log("[REMOTE] " .. path .. " | Args: " .. args)
 		end
 	end
-	if typeof(original) == "function" and isLuaFn(original) then
-		log("[ERR] namecall gia' rotto. Rientra nel gioco, poi riesegui.")
-		return
-	end
-	box.old = original
-	box.on = false
-	box.busy = false
-	box.log = log
-	box.dump = dumpValue
-	box.hits = textHits
-	box.method = getnamecallmethod
 	local detour = newcclosure(function(self, ...)
-		local state = box
-		if typeof(getgenv) == "function" then
-			local live = getgenv().__DeltaNamecallSpy
-			if typeof(live) == "table" then
-				state = live
+		if box.on and not box.busy then
+			local method = getnamecallmethod()
+			if method == "FireServer" and typeof(self) == "Instance" then
+				box.busy = true
+				pcall(logFire, self, ...)
+				box.busy = false
 			end
 		end
-		if state.on and not state.busy and typeof(self) == "Instance" and typeof(state.method) == "function" then
-			local method = state.method()
-			if method == "FireServer" then
-				state.busy = true
-				pcall(function()
-					local path = self:GetFullName()
-					local packed = { ... }
-					local shown = {}
-					for i = 1, #packed do
-						shown[i] = state.dump(packed[i], 0)
-					end
-					local args = table.concat(shown, ", ")
-					if state.hits(path .. " " .. args) then
-						state.log("[REMOTE] " .. path .. " | Args: " .. args)
-					end
-				end)
-				state.busy = false
-			end
-		end
-		local call = state.old
-		if typeof(call) ~= "function" then
+		return original(self, ...)
+	end)
+	if typeof(detour) ~= "function" then
+		log("[ERR] detour assente, hook non installato")
+		return
+	end
+	if typeof(setreadonly) == "function" then
+		local unlocked = pcall(setreadonly, mt, false)
+		if not unlocked then
+			log("[ERR] metatable bloccata, hook non installato")
 			return
 		end
-		return call(self, ...)
-	end)
-	local ok, returned = pcall(hookmetamethod, game, "__namecall", detour)
-	if typeof(box.old) ~= "function" and typeof(returned) == "function" then
-		box.old = returned
 	end
-	if not ok or typeof(box.old) ~= "function" then
-		log("[ERR] hook " .. tostring(returned))
+	local wrote, writeErr = pcall(function()
+		mt.__namecall = detour
+	end)
+	if typeof(setreadonly) == "function" then
+		pcall(setreadonly, mt, true)
+	end
+	if not wrote then
+		log("[ERR] hook " .. tostring(writeErr))
+		return
+	end
+	if namecallNow() == original then
+		log("[ERR] namecall non sostituito")
 		return
 	end
 	box.ready = true
