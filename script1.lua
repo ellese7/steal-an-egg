@@ -986,48 +986,29 @@ copyBtn.MouseButton1Click:Connect(function()
 		log("[ERR] namecall impilato. Chiudi il gioco, rientra, poi COPIA LOG.")
 		return
 	end
-	box.copying = true
 	if not setNamecall(engine) then
-		box.copying = false
 		log("[ERR] namecall non staccato")
 		return
 	end
-	task.delay(3, function()
-		box.copying = false
-		if typeof(box.detour) == "function" and namecallNow() ~= box.detour then
-			setNamecall(box.detour)
-		end
-	end)
+	box.copying = true
+	box.detour = nil
+	if typeof(box.clipBox) == "Instance" then
+		box.clipBox:Destroy()
+		box.clipBox = nil
+	end
 	local g = env
 	if typeof(getgenv) == "function" then
 		g = getgenv()
 	end
-	g.__psxClip = text
-	local result
-	local runner
-	if typeof(loadstring) == "function" then
-		runner = loadstring("return getgenv().setclipboard(getgenv().__psxClip)")
-	end
-	if typeof(runner) == "function" then
-		local okRun, value = pcall(runner)
-		if okRun then
-			result = value
-		end
-	elseif typeof(g.setclipboard) == "function" then
-		result = g.setclipboard(text)
-	elseif typeof(g.toclipboard) == "function" then
-		result = g.toclipboard(text)
-	end
-	g.__psxClip = nil
-	local boxCopied = false
-	local held = 0
 	local holder = Instance.new("TextBox")
+	holder.Name = "DeltaLogCopy"
 	holder.ClearTextOnFocus = false
 	holder.TextEditable = true
 	holder.MultiLine = true
-	holder.Size = UDim2.fromOffset(360, 120)
+	holder.Size = UDim2.fromOffset(360, 140)
 	holder.Position = UDim2.fromOffset(12, 220)
-	holder.BackgroundTransparency = 0.2
+	holder.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
+	holder.TextColor3 = Color3.fromRGB(210, 216, 200)
 	holder.TextSize = 12
 	holder.Font = Enum.Font.Code
 	holder.TextXAlignment = Enum.TextXAlignment.Left
@@ -1035,66 +1016,45 @@ copyBtn.MouseButton1Click:Connect(function()
 	holder.ZIndex = 20
 	holder.Parent = gui
 	holder.Text = text
-	held = #holder.Text
-	if holder.Text == text then
-		holder:CaptureFocus()
-		task.wait()
-		holder.CursorPosition = #holder.Text + 1
-		holder.SelectionStart = 1
-		task.wait()
-		local selected = holder:IsFocused() and holder.SelectionStart == 1 and holder.CursorPosition == #holder.Text + 1
-		if selected then
-			local down = g.keypress or rawget(_G, "keypress")
-			local up = g.keyrelease or rawget(_G, "keyrelease")
-			if typeof(down) == "function" and typeof(up) == "function" then
-				down(0x11)
-				task.wait(0.05)
-				down(0x43)
-				task.wait(0.05)
-				up(0x43)
-				up(0x11)
-			else
-				local vim = game:GetService("VirtualInputManager")
-				vim:SendKeyEvent(true, Enum.KeyCode.LeftControl, false, game)
-				vim:SendKeyEvent(true, Enum.KeyCode.C, false, game)
-				task.wait(0.05)
-				vim:SendKeyEvent(false, Enum.KeyCode.C, false, game)
-				vim:SendKeyEvent(false, Enum.KeyCode.LeftControl, false, game)
+	box.clipBox = holder
+	local held = #holder.Text
+	if holder.Text ~= text then
+		holder:Destroy()
+		box.clipBox = nil
+		box.copying = false
+		local writeFn = g.writefile
+		local readFn = g.readfile
+		local fileOk = false
+		if typeof(writeFn) == "function" and typeof(readFn) == "function" then
+			local wrote = pcall(writeFn, "psx_delta_log.txt", text)
+			if wrote then
+				local okBack, back = pcall(readFn, "psx_delta_log.txt")
+				fileOk = okBack and back == text
 			end
-			task.wait(0.2)
-			boxCopied = true
 		end
-		holder:ReleaseFocus()
+		if fileOk then
+			log("[ERR] log di " .. tostring(#text) .. " caratteri, la casella ne tiene " .. tostring(held) .. ". Testo in psx_delta_log.txt")
+		else
+			log("[ERR] log di " .. tostring(#text) .. " caratteri, la casella ne tiene " .. tostring(held))
+		end
+		return
 	end
-	holder:Destroy()
-	if typeof(box.detour) == "function" then
-		setNamecall(box.detour)
-	end
+	task.wait()
+	holder:CaptureFocus()
+	task.wait()
+	holder.CursorPosition = #holder.Text + 1
+	holder.SelectionStart = 1
 	box.copying = false
-	if result == true or boxCopied then
-		log("[COPY] " .. tostring(rows) .. " righe negli appunti")
-		return
+	local selected = holder:IsFocused() and holder.SelectionStart == 1 and holder.Text == text
+	if selected then
+		log("[COPY] " .. tostring(rows) .. " righe selezionate. Premi Ctrl+C, poi incolla.")
+	else
+		log("[ERR] selezione non riuscita")
 	end
-	local writeFn = g.writefile or rawget(_G, "writefile")
-	local readFn = g.readfile or rawget(_G, "readfile")
-	local fileOk = false
-	if typeof(writeFn) == "function" and typeof(readFn) == "function" then
-		local wrote = pcall(writeFn, "psx_delta_log.txt", text)
-		if wrote then
-			local okBack, back = pcall(readFn, "psx_delta_log.txt")
-			fileOk = okBack and back == text
-		end
+	local clipFn = g.setclipboard or g.toclipboard
+	if typeof(clipFn) == "function" then
+		clipFn(text)
 	end
-	local where = fileOk and " | testo in psx_delta_log.txt" or ""
-	if result == false then
-		log("[ERR] setclipboard ha rifiutato la scrittura" .. where)
-		return
-	end
-	if typeof(g.setclipboard) ~= "function" and typeof(g.toclipboard) ~= "function" then
-		log("[ERR] setclipboard assente" .. where)
-		return
-	end
-	log("[ERR] appunti invariati (casella " .. tostring(held) .. " su " .. tostring(#text) .. ")" .. where)
 end)
 
 boostBtn.MouseButton1Click:Connect(function()
