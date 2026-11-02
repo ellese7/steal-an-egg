@@ -619,7 +619,10 @@ end
 
 local function ensureEngine()
 	local box = spyBox()
-	if typeof(box.engine) == "function" and not isLuaFn(box.engine) then
+	if typeof(box.engine) == "function" and (isLuaFn(box.engine) or upvalueCount(box.engine) > 0) then
+		box.engine = nil
+	end
+	if typeof(box.engine) == "function" then
 		return box.engine
 	end
 	local current, mt = namecallNow()
@@ -630,9 +633,12 @@ local function ensureEngine()
 		return nil
 	end
 	local recovered = recoverEngine(current)
-	if typeof(recovered) == "function" then
+	if typeof(recovered) == "function" and upvalueCount(recovered) == 0 then
 		box.engine = recovered
 		return recovered
+	end
+	if upvalueCount(current) > 0 then
+		return nil
 	end
 	if typeof(box.detour) == "function" and current == box.detour then
 		return nil
@@ -992,52 +998,73 @@ copyBtn.MouseButton1Click:Connect(function()
 			setNamecall(box.detour)
 		end
 	end)
-	local g = _G
+	local g = env
 	if typeof(getgenv) == "function" then
 		g = getgenv()
 	end
-	local clipFn = g.setclipboard or g.toclipboard or rawget(_G, "setclipboard") or rawget(_G, "toclipboard")
+	g.__psxClip = text
 	local result
-	if typeof(clipFn) == "function" then
-		result = clipFn(text)
-		if result == false then
-			for _ = 1, 6 do
-				task.wait(0.05)
-				result = clipFn(text)
-				if result ~= false then
-					break
-				end
-			end
-		end
+	local runner
+	if typeof(loadstring) == "function" then
+		runner = loadstring("return getgenv().setclipboard(getgenv().__psxClip)")
 	end
+	if typeof(runner) == "function" then
+		local okRun, value = pcall(runner)
+		if okRun then
+			result = value
+		end
+	elseif typeof(g.setclipboard) == "function" then
+		result = g.setclipboard(text)
+	elseif typeof(g.toclipboard) == "function" then
+		result = g.toclipboard(text)
+	end
+	g.__psxClip = nil
 	local boxCopied = false
+	local held = 0
 	local holder = Instance.new("TextBox")
 	holder.ClearTextOnFocus = false
 	holder.TextEditable = true
 	holder.MultiLine = true
-	holder.Size = UDim2.fromOffset(8, 8)
-	holder.Position = UDim2.fromOffset(-2000, -2000)
-	holder.BackgroundTransparency = 1
-	holder.TextTransparency = 1
+	holder.Size = UDim2.fromOffset(360, 120)
+	holder.Position = UDim2.fromOffset(12, 220)
+	holder.BackgroundTransparency = 0.2
+	holder.TextSize = 12
+	holder.Font = Enum.Font.Code
+	holder.TextXAlignment = Enum.TextXAlignment.Left
+	holder.TextYAlignment = Enum.TextYAlignment.Top
+	holder.ZIndex = 20
 	holder.Parent = gui
 	holder.Text = text
+	held = #holder.Text
 	if holder.Text == text then
-		pcall(function()
-			holder:CaptureFocus()
-			task.wait()
-			holder.CursorPosition = #holder.Text + 1
-			holder.SelectionStart = 1
-			task.wait()
-			if not holder:IsFocused() or holder.SelectionStart ~= 1 then
-				return
+		holder:CaptureFocus()
+		task.wait()
+		holder.CursorPosition = #holder.Text + 1
+		holder.SelectionStart = 1
+		task.wait()
+		local selected = holder:IsFocused() and holder.SelectionStart == 1 and holder.CursorPosition == #holder.Text + 1
+		if selected then
+			local down = g.keypress or rawget(_G, "keypress")
+			local up = g.keyrelease or rawget(_G, "keyrelease")
+			if typeof(down) == "function" and typeof(up) == "function" then
+				down(0x11)
+				task.wait(0.05)
+				down(0x43)
+				task.wait(0.05)
+				up(0x43)
+				up(0x11)
+			else
+				local vim = game:GetService("VirtualInputManager")
+				vim:SendKeyEvent(true, Enum.KeyCode.LeftControl, false, game)
+				vim:SendKeyEvent(true, Enum.KeyCode.C, false, game)
+				task.wait(0.05)
+				vim:SendKeyEvent(false, Enum.KeyCode.C, false, game)
+				vim:SendKeyEvent(false, Enum.KeyCode.LeftControl, false, game)
 			end
-			local vim = game:GetService("VirtualInputManager")
-			vim:SendKeyEvent(true, Enum.KeyCode.LeftControl, false, game)
-			vim:SendKeyEvent(true, Enum.KeyCode.C, false, game)
-			vim:SendKeyEvent(false, Enum.KeyCode.C, false, game)
-			vim:SendKeyEvent(false, Enum.KeyCode.LeftControl, false, game)
+			task.wait(0.2)
 			boxCopied = true
-		end)
+		end
+		holder:ReleaseFocus()
 	end
 	holder:Destroy()
 	if typeof(box.detour) == "function" then
@@ -1048,15 +1075,26 @@ copyBtn.MouseButton1Click:Connect(function()
 		log("[COPY] " .. tostring(rows) .. " righe negli appunti")
 		return
 	end
-	if typeof(clipFn) ~= "function" then
-		log("[ERR] setclipboard assente")
-		return
+	local writeFn = g.writefile or rawget(_G, "writefile")
+	local readFn = g.readfile or rawget(_G, "readfile")
+	local fileOk = false
+	if typeof(writeFn) == "function" and typeof(readFn) == "function" then
+		local wrote = pcall(writeFn, "psx_delta_log.txt", text)
+		if wrote then
+			local okBack, back = pcall(readFn, "psx_delta_log.txt")
+			fileOk = okBack and back == text
+		end
 	end
+	local where = fileOk and " | testo in psx_delta_log.txt" or ""
 	if result == false then
-		log("[ERR] setclipboard ha rifiutato la scrittura")
+		log("[ERR] setclipboard ha rifiutato la scrittura" .. where)
 		return
 	end
-	log("[COPY] " .. tostring(rows) .. " righe negli appunti")
+	if typeof(g.setclipboard) ~= "function" and typeof(g.toclipboard) ~= "function" then
+		log("[ERR] setclipboard assente" .. where)
+		return
+	end
+	log("[ERR] appunti invariati (casella " .. tostring(held) .. " su " .. tostring(#text) .. ")" .. where)
 end)
 
 boostBtn.MouseButton1Click:Connect(function()
@@ -1075,4 +1113,7 @@ env.__DeltaPetSpeed = {
 	stop = shutdown,
 }
 
+if typeof(spyBox().detour) == "function" and typeof(ensureEngine()) ~= "function" then
+	log("[ERR] namecall impilato. Chiudi il gioco, rientra, poi riesegui.")
+end
 log("[READY] Delta pet speed")
