@@ -532,17 +532,6 @@ end
 local spyOn = false
 local spyBusy = false
 local namecallReady = false
-local KEYS = { "pet", "coin", "chest", "breakable", "attack", "hit", "farm", "equip", "join" }
-
-local function textHits(text)
-	local low = string.lower(text)
-	for i = 1, #KEYS do
-		if string.find(low, KEYS[i], 1, true) then
-			return true
-		end
-	end
-	return false
-end
 
 local function dumpValue(value, depth)
 	if depth > 2 then
@@ -603,11 +592,11 @@ end
 
 local function spyStart()
 	local box = spyBox()
-	if (namecallReady or box.ready) and typeof(box.real) == "function" and typeof(box.detour) == "function" then
-		namecallReady = true
-		setSpy(true)
-		log("[REMOTE] spy attivo")
-		return
+	if box.drain then
+		pcall(function()
+			box.drain:Disconnect()
+		end)
+		box.drain = nil
 	end
 	local getnamecallmethod = api("getnamecallmethod")
 	local newcclosure = api("newcclosure")
@@ -638,91 +627,18 @@ local function spyStart()
 		log("[ERR] newcclosure perde gli upvalue, hook non installato")
 		return
 	end
-local seenAttr = {}
-local pendingId
-local pendingName
-local pendingAttrs
-local pendingPets = {}
-local flushScheduled = false
-
-local function findCoin(raw)
-	local id = tostring(raw)
-	local things = workspace:FindFirstChild("__THINGS")
-	local folder = things and things:FindFirstChild("Coins")
-	if not folder then
-		return nil
-	end
-	local kids = folder:GetChildren()
-	for i = 1, #kids do
-		local coin = kids[i]
-		if coin.Name == id then
-			return coin
-		end
-	end
-	return nil
-end
-
-local function attrDump(coin)
-	local parts = {}
-	local attrs = coin:GetAttributes()
-	for key, value in pairs(attrs) do
-		parts[#parts + 1] = tostring(key) .. "=" .. tostring(value)
-	end
-	table.sort(parts)
-	return table.concat(parts, ", ")
-end
-
-local function flushBreak()
-	flushScheduled = false
-	if not pendingId then
-		return
-	end
-	log(string.format("[BREAK] %s | id=%s | pet=%d | %s", pendingName, pendingId, #pendingPets, table.concat(pendingPets, ", ")))
-	if pendingAttrs then
-		log("[ATTR] " .. pendingId .. " | " .. pendingAttrs)
-		pendingAttrs = nil
-	end
-	pendingPets = {}
-	pendingId = nil
-	pendingName = nil
-end
-
 local function logFire(self, ...)
-		local path = self:GetFullName()
+		local path = "?"
+		pcall(function()
+			path = self:GetFullName()
+		end)
 		local packed = { ... }
-		if packed[2] == "Coin" and packed[3] ~= nil then
-			local id = tostring(packed[3])
-			if pendingId ~= id then
-				if pendingId then
-					flushBreak()
-				end
-				pendingId = id
-				local coin = findCoin(id)
-				if coin then
-					pendingName = tostring(coin:GetAttribute("Name"))
-					if not seenAttr[id] then
-						seenAttr[id] = true
-						pendingAttrs = attrDump(coin)
-					end
-				else
-					pendingName = "nome assente"
-				end
-			end
-			pendingPets[#pendingPets + 1] = tostring(packed[1])
-			if not flushScheduled then
-				flushScheduled = true
-				task.delay(0.2, flushBreak)
-			end
-			return
-		end
 		local shown = {}
-		for i = 1, #packed do
+		local n = select("#", ...)
+		for i = 1, n do
 			shown[i] = dumpValue(packed[i], 0)
 		end
-		local args = table.concat(shown, ", ")
-		if textHits(path .. " " .. args) then
-			log("[REMOTE] " .. path .. " | Args: " .. args)
-		end
+		log("[RAW] " .. path .. " | Args: " .. table.concat(shown, ", "))
 	end
 	box.queue = {}
 	if not box.drain then
@@ -734,14 +650,17 @@ local function logFire(self, ...)
 			box.queue = {}
 			for i = 1, #q do
 				local item = q[i]
-				pcall(logFire, item.remote, unpack(item.args, 1, item.n))
+				local ok, err = pcall(logFire, item.remote, unpack(item.args, 1, item.n))
+				if not ok then
+					log("[ERRORE LOG] " .. tostring(err))
+				end
 			end
 		end)
 	end
 	local detour = newcclosure(function(self, ...)
 		if box.on then
 			local method = getnamecallmethod()
-			if method == "FireServer" then
+			if method == "FireServer" or method == "InvokeServer" then
 				local q = box.queue
 				if typeof(q) == "table" then
 					q[#q + 1] = { remote = self, n = select("#", ...), args = { ... } }
@@ -818,9 +737,7 @@ local function scanRemotes()
 		if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") or inst:IsA("UnreliableRemoteEvent") then
 			total = total + 1
 			local path = inst:GetFullName()
-			if textHits(path) then
-				shown = shown + 1
-			elseif inst.Parent == rs and string.match(inst.Name, "^%x+$") and #inst.Name >= 16 then
+			if inst.Parent == rs and string.match(inst.Name, "^%x+$") and #inst.Name >= 16 then
 				shown = shown + 1
 			end
 		end
