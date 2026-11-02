@@ -629,9 +629,14 @@ local function spyStart()
 	end
 local function logFire(self, ...)
 		local path = "?"
-		pcall(function()
-			path = self:GetFullName()
-		end)
+		if typeof(self) == "Instance" then
+			local ok, full = pcall(function()
+				return self:GetFullName()
+			end)
+			if ok then
+				path = full
+			end
+		end
 		local packed = { ... }
 		local shown = {}
 		local n = select("#", ...)
@@ -640,32 +645,34 @@ local function logFire(self, ...)
 		end
 		log("[RAW] " .. path .. " | Args: " .. table.concat(shown, ", "))
 	end
-	box.queue = {}
-	if not box.drain then
-		box.drain = RunService.Heartbeat:Connect(function()
-			local q = box.queue
-			if typeof(q) ~= "table" or #q == 0 then
-				return
-			end
-			box.queue = {}
-			for i = 1, #q do
-				local item = q[i]
-				local ok, err = pcall(logFire, item.remote, unpack(item.args, 1, item.n))
-				if not ok then
-					log("[ERRORE LOG] " .. tostring(err))
-				end
-			end
-		end)
-	end
+	local counts = {}
 	local detour = newcclosure(function(self, ...)
-		if box.on then
-			local method = getnamecallmethod()
-			if method == "FireServer" or method == "InvokeServer" then
-				local q = box.queue
-				if typeof(q) == "table" then
-					q[#q + 1] = { remote = self, n = select("#", ...), args = { ... } }
-				end
+		local method
+		if box.on and not box.busy then
+			method = getnamecallmethod()
+			if method == nil then
+				pcall(function()
+					local g = getgenv()
+					local alt = g and g.getnamecallmethod
+					if typeof(alt) == "function" then
+						method = alt()
+					end
+				end)
 			end
+			local key = tostring(method)
+			counts[key] = (counts[key] or 0) + 1
+		end
+		if (method == "FireServer" or method == "InvokeServer") and not box.busy then
+			local argc = select("#", ...)
+			local args = { ... }
+			local pack = table.pack(original(self, ...))
+			box.busy = true
+			local ok, err = pcall(logFire, self, unpack(args, 1, argc))
+			box.busy = false
+			if not ok then
+				log("[ERRORE LOG] " .. tostring(err))
+			end
+			return unpack(pack, 1, pack.n)
 		end
 		return original(self, ...)
 	end)
@@ -699,6 +706,38 @@ local function logFire(self, ...)
 	box.detour = detour
 	box.ready = true
 	namecallReady = true
+	if box.drain then
+		pcall(function()
+			box.drain:Disconnect()
+		end)
+	end
+	box.drain = RunService.Heartbeat:Connect(function()
+		if not box.tick then
+			box.tick = os.clock()
+		end
+		if os.clock() - box.tick < 1 then
+			return
+		end
+		box.tick = os.clock()
+		local parts = {}
+		local extra = 0
+		for key, value in pairs(counts) do
+			if #parts < 8 then
+				parts[#parts + 1] = key .. "=" .. tostring(value)
+			else
+				extra = extra + value
+			end
+			counts[key] = nil
+		end
+		if #parts == 0 then
+			return
+		end
+		table.sort(parts)
+		if extra > 0 then
+			parts[#parts + 1] = "altri=" .. tostring(extra)
+		end
+		log("[HOOK] " .. table.concat(parts, " "))
+	end)
 	setSpy(true)
 	log("[REMOTE] spy attivo")
 end
