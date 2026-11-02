@@ -812,11 +812,12 @@ local function setNamecall(fn)
 		pcall(setreadonly, box.mt, false)
 	end
 	pcall(function()
-		box.mt.__namecall = fn
+		rawset(box.mt, "__namecall", fn)
 	end)
 	if typeof(setreadonly) == "function" then
 		pcall(setreadonly, box.mt, true)
 	end
+	return namecallNow() == fn
 end
 
 local function spyStop()
@@ -962,52 +963,11 @@ stopBtn.MouseButton1Click:Connect(function()
 	end
 end)
 
-local function clipMatches(got, text)
-	if typeof(got) ~= "string" or got == "" or typeof(text) ~= "string" or text == "" then
-		return false
-	end
-	local function norm(s)
-		s = string.gsub(s, "\r\n", "\n")
-		return string.gsub(s, "\r", "\n")
-	end
-	local a = norm(got)
-	local b = norm(text)
-	if a == b then
-		return true
-	end
-	return string.sub(a, -1) == "\n" and string.sub(a, 1, -2) == b
-end
-
-local function envFn(name)
-	local luaFn
-	local function consider(fn)
-		if typeof(fn) ~= "function" then
-			return nil
-		end
-		if not isLuaFn(fn) then
-			return fn
-		end
-		if luaFn == nil then
-			luaFn = fn
-		end
-		return nil
-	end
-	local picked
-	pcall(function()
-		if typeof(getgenv) == "function" then
-			picked = consider(getgenv()[name])
-		end
-	end)
-	if typeof(picked) ~= "function" then
-		picked = consider(rawget(_G, name))
-	end
-	if typeof(picked) == "function" then
-		return picked
-	end
-	return luaFn
-end
-
 copyBtn.MouseButton1Click:Connect(function()
+	local box = spyBox()
+	if box.copying then
+		return
+	end
 	setSpy(false)
 	local text = table.concat(logs, "\n")
 	local rows = #logs
@@ -1015,66 +975,88 @@ copyBtn.MouseButton1Click:Connect(function()
 		log("[COPY] log vuoto")
 		return
 	end
-	local box = spyBox()
 	local engine = ensureEngine()
 	if typeof(engine) ~= "function" then
 		log("[ERR] namecall impilato. Chiudi il gioco, rientra, poi COPIA LOG.")
 		return
 	end
-	setNamecall(engine)
-	local clipFn = envFn("setclipboard") or envFn("toclipboard") or envFn("setrbxclipboard")
-	local readFn = envFn("getclipboard")
-	local callOk, callErr = false, "assente"
-	if typeof(clipFn) == "function" then
-		callOk, callErr = pcall(clipFn, text)
+	box.copying = true
+	if not setNamecall(engine) then
+		box.copying = false
+		log("[ERR] namecall non staccato")
+		return
 	end
-	local got
-	local readOk = false
-	if typeof(readFn) == "function" then
-		local okRead, value = pcall(readFn)
-		readOk = okRead and typeof(value) == "string"
-		if readOk then
-			got = value
+	task.delay(3, function()
+		box.copying = false
+		if typeof(box.detour) == "function" and namecallNow() ~= box.detour then
+			setNamecall(box.detour)
+		end
+	end)
+	local g = _G
+	if typeof(getgenv) == "function" then
+		g = getgenv()
+	end
+	local clipFn = g.setclipboard or g.toclipboard or rawget(_G, "setclipboard") or rawget(_G, "toclipboard")
+	local result
+	if typeof(clipFn) == "function" then
+		result = clipFn(text)
+		if result == false then
+			for _ = 1, 6 do
+				task.wait(0.05)
+				result = clipFn(text)
+				if result ~= false then
+					break
+				end
+			end
 		end
 	end
+	local boxCopied = false
+	local holder = Instance.new("TextBox")
+	holder.ClearTextOnFocus = false
+	holder.TextEditable = true
+	holder.MultiLine = true
+	holder.Size = UDim2.fromOffset(8, 8)
+	holder.Position = UDim2.fromOffset(-2000, -2000)
+	holder.BackgroundTransparency = 1
+	holder.TextTransparency = 1
+	holder.Parent = gui
+	holder.Text = text
+	if holder.Text == text then
+		pcall(function()
+			holder:CaptureFocus()
+			task.wait()
+			holder.CursorPosition = #holder.Text + 1
+			holder.SelectionStart = 1
+			task.wait()
+			if not holder:IsFocused() or holder.SelectionStart ~= 1 then
+				return
+			end
+			local vim = game:GetService("VirtualInputManager")
+			vim:SendKeyEvent(true, Enum.KeyCode.LeftControl, false, game)
+			vim:SendKeyEvent(true, Enum.KeyCode.C, false, game)
+			vim:SendKeyEvent(false, Enum.KeyCode.C, false, game)
+			vim:SendKeyEvent(false, Enum.KeyCode.LeftControl, false, game)
+			boxCopied = true
+		end)
+	end
+	holder:Destroy()
 	if typeof(box.detour) == "function" then
 		setNamecall(box.detour)
 	end
-	local writeFn = envFn("writefile")
-	local fileRead = envFn("readfile")
-	local fileOk = false
-	if typeof(writeFn) == "function" and typeof(fileRead) == "function" then
-		local wrote = pcall(writeFn, "psx_delta_log.txt", text)
-		if wrote then
-			local okBack, back = pcall(fileRead, "psx_delta_log.txt")
-			fileOk = okBack and back == text
-		end
+	box.copying = false
+	if result == true or boxCopied then
+		log("[COPY] " .. tostring(rows) .. " righe negli appunti")
+		return
 	end
 	if typeof(clipFn) ~= "function" then
 		log("[ERR] setclipboard assente")
 		return
 	end
-	if not callOk then
-		log("[ERR] setclipboard " .. tostring(callErr))
+	if result == false then
+		log("[ERR] setclipboard ha rifiutato la scrittura")
 		return
 	end
-	if typeof(readFn) ~= "function" then
-		log("[ERR] getclipboard assente, paste non verificato")
-		return
-	end
-	if not readOk then
-		log("[ERR] getclipboard non ha restituito il testo")
-		return
-	end
-	if clipMatches(got, text) then
-		log("[COPY] " .. tostring(rows) .. " righe negli appunti")
-		return
-	end
-	local where = ""
-	if fileOk then
-		where = " | testo in psx_delta_log.txt"
-	end
-	log("[ERR] clipboard non aggiornata (letti " .. tostring(#got) .. " su " .. tostring(#text) .. ")" .. where)
+	log("[COPY] " .. tostring(rows) .. " righe negli appunti")
 end)
 
 boostBtn.MouseButton1Click:Connect(function()
