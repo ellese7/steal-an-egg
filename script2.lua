@@ -520,57 +520,114 @@ local function dumpValue(value, depth)
 	return kind
 end
 
+local function isLuaFn(fn)
+	if typeof(fn) ~= "function" or typeof(debug) ~= "table" or typeof(debug.info) ~= "function" then
+		return false
+	end
+	local ok, src = pcall(debug.info, fn, "s")
+	return ok and typeof(src) == "string" and src ~= "=[C]" and src ~= "[C]"
+end
+
+local function spyBox()
+	local box = env.__DeltaNamecallSpy
+	if typeof(box) ~= "table" then
+		box = { on = false, busy = false, ready = false }
+		env.__DeltaNamecallSpy = box
+	end
+	return box
+end
+
+local function setSpy(flag)
+	spyOn = flag
+	spyBox().on = flag
+end
+
 local function spyStart()
-	if namecallReady then
-		spyOn = true
+	local box = spyBox()
+	if namecallReady or box.ready then
+		namecallReady = true
+		setSpy(true)
 		log("[REMOTE] spy attivo")
 		return
 	end
 	local hookmetamethod = api("hookmetamethod")
 	local getnamecallmethod = api("getnamecallmethod")
-	if typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" then
-		log("[ERR] hookmetamethod assente")
+	local newcclosure = api("newcclosure")
+	local getrawmetatable = api("getrawmetatable")
+	if typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" or typeof(newcclosure) ~= "function" then
+		log("[ERR] hookmetamethod o newcclosure assente")
 		return
 	end
-	local ok, err = pcall(function()
-		local old
-		old = hookmetamethod(game, "__namecall", function(self, ...)
-			if spyOn and not spyBusy and typeof(self) == "Instance" then
-				local method = getnamecallmethod()
-				if method == "FireServer" then
-					spyBusy = true
-					pcall(function()
-						local path = self:GetFullName()
-						local packed = { ... }
-						local shown = {}
-						for i = 1, #packed do
-							shown[i] = dumpValue(packed[i], 0)
-						end
-						local args = table.concat(shown, ", ")
-						if textHits(path .. " " .. args) then
-							log("[REMOTE] " .. path .. " | Args: " .. args)
-						end
-					end)
-					spyBusy = false
-				end
+	local original
+	if typeof(getrawmetatable) == "function" then
+		local ok, mt = pcall(getrawmetatable, game)
+		if ok and typeof(mt) == "table" then
+			original = mt.__namecall
+		end
+	end
+	if typeof(original) == "function" and isLuaFn(original) then
+		log("[ERR] namecall gia' rotto. Rientra nel gioco, poi riesegui.")
+		return
+	end
+	box.old = original
+	box.on = false
+	box.busy = false
+	box.log = log
+	box.dump = dumpValue
+	box.hits = textHits
+	box.method = getnamecallmethod
+	local detour = newcclosure(function(self, ...)
+		local state = box
+		if typeof(getgenv) == "function" then
+			local live = getgenv().__DeltaNamecallSpy
+			if typeof(live) == "table" then
+				state = live
 			end
-			return old(self, ...)
-		end)
+		end
+		if state.on and not state.busy and typeof(self) == "Instance" and typeof(state.method) == "function" then
+			local method = state.method()
+			if method == "FireServer" then
+				state.busy = true
+				pcall(function()
+					local path = self:GetFullName()
+					local packed = { ... }
+					local shown = {}
+					for i = 1, #packed do
+						shown[i] = state.dump(packed[i], 0)
+					end
+					local args = table.concat(shown, ", ")
+					if state.hits(path .. " " .. args) then
+						state.log("[REMOTE] " .. path .. " | Args: " .. args)
+					end
+				end)
+				state.busy = false
+			end
+		end
+		local call = state.old
+		if typeof(call) ~= "function" then
+			return
+		end
+		return call(self, ...)
 	end)
-	if not ok then
-		log("[ERR] hook " .. tostring(err))
+	local ok, returned = pcall(hookmetamethod, game, "__namecall", detour)
+	if typeof(box.old) ~= "function" and typeof(returned) == "function" then
+		box.old = returned
+	end
+	if not ok or typeof(box.old) ~= "function" then
+		log("[ERR] hook " .. tostring(returned))
 		return
 	end
+	box.ready = true
 	namecallReady = true
-	spyOn = true
+	setSpy(true)
 	log("[REMOTE] spy attivo")
 end
 
 local function spyStop()
-	if not spyOn then
+	if not spyOn and not spyBox().on then
 		return
 	end
-	spyOn = false
+	setSpy(false)
 	log("[REMOTE] spy spento")
 end
 
@@ -608,7 +665,7 @@ end
 
 local function shutdown()
 	alive = false
-	spyOn = false
+	setSpy(false)
 	restore()
 	pcall(function()
 		gui:Destroy()
@@ -714,7 +771,7 @@ stopBtn.MouseButton1Click:Connect(function()
 end)
 
 copyBtn.MouseButton1Click:Connect(function()
-	spyOn = false
+	setSpy(false)
 	local text = table.concat(logs, "\n")
 	if text == "" then
 		log("[COPY] log vuoto")
