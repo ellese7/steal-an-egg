@@ -49,6 +49,7 @@ local logs = {}
 local logScroll
 local logRows = {}
 local targets = {}
+local loggedFunc = {}
 local holdConn
 local holding = false
 local gui
@@ -323,7 +324,11 @@ local function scanFunction(fn, how, seen, depth)
 	local src = sourceOf(fn)
 	local interesting = hasConst(fn, "Pet Walkspeed") or string.find(src, "Game.Pets", 1, true) ~= nil
 	if interesting then
-		log(string.format("[FUNC] Trovata funzione: %s | upvalue: %d | via %s", cut(src, 140), upvalueCount(fn), how))
+		local key = src .. "|" .. tostring(upvalueCount(fn))
+		if not loggedFunc[key] then
+			loggedFunc[key] = true
+			log(string.format("[FUNC] Trovata funzione: %s | upvalue: %d | via %s", cut(src, 140), upvalueCount(fn), how))
+		end
 	end
 	for i = 1, 80 do
 		local _, val, alive = upvalueAt(fn, i)
@@ -719,15 +724,28 @@ local function logFire(self, ...)
 			log("[REMOTE] " .. path .. " | Args: " .. args)
 		end
 	end
+	box.queue = {}
+	if not box.drain then
+		box.drain = RunService.Heartbeat:Connect(function()
+			local q = box.queue
+			if typeof(q) ~= "table" or #q == 0 then
+				return
+			end
+			box.queue = {}
+			for i = 1, #q do
+				local item = q[i]
+				pcall(logFire, item.remote, unpack(item.args, 1, item.n))
+			end
+		end)
+	end
 	local detour = newcclosure(function(self, ...)
 		if box.on then
 			local method = getnamecallmethod()
 			if method == "FireServer" then
-				local argc = select("#", ...)
-				local packed = { ... }
-				task.defer(function()
-					pcall(logFire, self, unpack(packed, 1, argc))
-				end)
+				local q = box.queue
+				if typeof(q) == "table" then
+					q[#q + 1] = { remote = self, n = select("#", ...), args = { ... } }
+				end
 			end
 		end
 		return original(self, ...)
