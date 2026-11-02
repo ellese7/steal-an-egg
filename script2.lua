@@ -1,244 +1,606 @@
--- Anti-AFK (Delta) — light toggle, no rejoin
--- NO VirtualUser / VIM (those = Kick 267). One short J tap via Delta input.
+-- Delta: trova la funzione di movimento dei pet e alza Upgrades["Pet Walkspeed"].
+-- getconnections, getgc, debug.getupvalue, debug.setupvalue.
+-- v113 non viene sostituito. Si fissa la tabella Upgrades che la funzione legge.
 
 local Players = game:GetService("Players")
-local UIS = game:GetService("UserInputService")
-local LP = Players.LocalPlayer
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
 
-local ENV = _G
+local env = _G
 pcall(function()
 	if typeof(getgenv) == "function" then
-		ENV = getgenv()
+		env = getgenv()
 	end
 end)
-if typeof(ENV.__AntiAfkDeltaKill) == "function" then
-	pcall(ENV.__AntiAfkDeltaKill)
+if typeof(env.__DeltaPetSpeed) == "table" and typeof(env.__DeltaPetSpeed.stop) == "function" then
+	pcall(env.__DeltaPetSpeed.stop)
 end
-
-local PERIODIC = 150
-local PREEMPT = 840
-local GAP = 12
-local BOOT = 2.5
-local VK_J = 0x4A
-
-local COL_ON = Color3.fromRGB(44, 112, 88)
-local COL_OFF = Color3.fromRGB(55, 60, 78)
-local COL_BAD = Color3.fromRGB(140, 70, 50)
 
 local alive = true
-local enabled = false
-local lastPoke = 0
-local lastActivity = os.clock()
-local nextAt = 0
-local idledConn, inputConn
-local btn
+local scanning = false
+local logs = {}
+local logBox
+local targets = {}
+local holdConn
+local holding = false
+local gui
 
-local function hasInput()
-	return typeof(keyclick) == "function"
-		or typeof(keypress) == "function"
-		or typeof(mouse2click) == "function"
-		or typeof(mouse1click) == "function"
-		or typeof(mouse1press) == "function"
+local function api(name)
+	if typeof(debug) == "table" and typeof(debug[name]) == "function" then
+		return debug[name]
+	end
+	local spots = { _G }
+	pcall(function()
+		if typeof(getgenv) == "function" then
+			spots[#spots + 1] = getgenv()
+		end
+	end)
+	for i = 1, #spots do
+		local ok, fn = pcall(function()
+			return spots[i][name]
+		end)
+		if ok and typeof(fn) == "function" then
+			return fn
+		end
+	end
+	return nil
 end
 
-local function pokeOnce()
-	if typeof(keyclick) == "function" then
-		local ok = pcall(keyclick, VK_J)
-		if ok then
-			return true
+local getconnections = api("getconnections")
+local getgc = api("getgc")
+local getupvalue = api("getupvalue")
+local setupvalue = api("setupvalue")
+local getconstants = api("getconstants")
+local getproto = api("getproto")
+local getprotos = api("getprotos")
+local setclip = api("setclipboard") or api("toclipboard") or api("setrbxclipboard")
+
+local function cut(text, n)
+	text = tostring(text or "")
+	if #text > n then
+		return string.sub(text, 1, n)
+	end
+	return text
+end
+
+local function pushLog(line)
+	logs[#logs + 1] = line
+	if #logs > 400 then
+		table.remove(logs, 1)
+	end
+	print(line)
+	if logBox then
+		local from = math.max(1, #logs - 40)
+		local shown = {}
+		for i = from, #logs do
+			shown[#shown + 1] = logs[i]
+		end
+		logBox.Text = table.concat(shown, "\n")
+	end
+end
+
+local function log(msg)
+	pushLog(string.format("[%s] %s", os.date("%H:%M:%S"), msg))
+end
+
+local function sourceOf(fn)
+	if typeof(fn) ~= "function" then
+		return ""
+	end
+	if typeof(debug) == "table" and typeof(debug.getinfo) == "function" then
+		local ok, info = pcall(debug.getinfo, fn)
+		if ok and typeof(info) == "table" then
+			return tostring(info.source or info.short_src or "")
 		end
 	end
-	if typeof(keypress) == "function" then
-		local ok = pcall(function()
-			keypress(VK_J)
-			task.wait(0.05)
-			if typeof(keyrelease) == "function" then
-				keyrelease(VK_J)
-			end
-		end)
-		if ok then
-			return true
+	if typeof(debug) == "table" and typeof(debug.info) == "function" then
+		local ok, src = pcall(debug.info, fn, "s")
+		if ok and typeof(src) == "string" then
+			return src
 		end
 	end
-	if typeof(mouse2click) == "function" then
-		local ok = pcall(mouse2click)
-		if ok then
-			return true
-		end
+	return ""
+end
+
+local function isFake(fn)
+	local src = string.lower(sourceOf(fn))
+	return string.find(src, "locales", 1, true) ~= nil or string.find(src, "coregui", 1, true) ~= nil
+end
+
+local function hasConst(fn, needle)
+	if typeof(getconstants) ~= "function" or typeof(fn) ~= "function" then
+		return false
 	end
-	if typeof(mouse1click) == "function" then
-		local ok = pcall(mouse1click)
-		if ok then
-			return true
-		end
+	local ok, list = pcall(getconstants, fn)
+	if not ok or typeof(list) ~= "table" then
+		return false
 	end
-	if typeof(mouse1press) == "function" then
-		local ok = pcall(function()
-			mouse1press()
-			task.wait(0.04)
-			if typeof(mouse1release) == "function" then
-				mouse1release()
-			end
-		end)
-		if ok then
+	for _, c in pairs(list) do
+		if c == needle then
 			return true
 		end
 	end
 	return false
 end
 
-local function paint()
-	if not btn then
-		return
-	end
-	if not hasInput() then
-		btn.Text = "AFK NO API"
-		btn.BackgroundColor3 = COL_BAD
-		return
-	end
-	btn.Text = enabled and "AFK ON" or "AFK OFF"
-	btn.BackgroundColor3 = enabled and COL_ON or COL_OFF
-end
-
-local function poke()
-	if not alive or not enabled then
-		return
-	end
-	local now = os.clock()
-	if now - lastPoke < GAP then
-		return
-	end
-	lastPoke = now
-	lastActivity = now
-	nextAt = now + PERIODIC + (math.random() * 40 - 10)
-	if not pokeOnce() then
-		enabled = false
-		paint()
-	end
-end
-
-local function stop()
-	enabled = false
-	if idledConn then
-		pcall(function()
-			idledConn:Disconnect()
-		end)
-		idledConn = nil
-	end
-	if inputConn then
-		pcall(function()
-			inputConn:Disconnect()
-		end)
-		inputConn = nil
-	end
-	paint()
-end
-
-local function start()
-	if enabled or not hasInput() then
-		paint()
-		return
-	end
-	enabled = true
-	lastPoke = 0
-	lastActivity = os.clock()
-	nextAt = os.clock() + BOOT + PERIODIC
-	paint()
-
-	idledConn = LP.Idled:Connect(function()
-		poke()
-	end)
-	inputConn = UIS.InputBegan:Connect(function(input)
-		if not alive or not enabled then
-			return
-		end
-		local t = input.UserInputType
-		if t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Focus then
-			return
-		end
-		lastActivity = os.clock()
-	end)
-
-	task.delay(BOOT, function()
-		if alive and enabled then
-			poke()
-		end
-	end)
-end
-
-task.spawn(function()
-	while alive do
-		if not enabled then
-			task.wait(1)
-		else
-			local now = os.clock()
-			local waitFor = nextAt - now
-			if now - lastActivity >= PREEMPT then
-				waitFor = 0
-			end
-			if waitFor > 1 then
-				task.wait(math.min(waitFor, 30))
-			else
-				task.wait(1)
-				if alive and enabled then
-					poke()
+local function childProtos(fn)
+	local list = {}
+	if typeof(getprotos) == "function" then
+		local ok, bag = pcall(getprotos, fn)
+		if ok and typeof(bag) == "table" then
+			for _, p in pairs(bag) do
+				if typeof(p) == "function" then
+					list[#list + 1] = p
+					if #list >= 40 then
+						return list
+					end
 				end
 			end
+			if #list > 0 then
+				return list
+			end
 		end
+	end
+	if typeof(getproto) ~= "function" then
+		return list
+	end
+	local misses = 0
+	for i = 1, 40 do
+		local ok, p = pcall(getproto, fn, i, true)
+		if not ok or typeof(p) ~= "function" then
+			ok, p = pcall(getproto, fn, i)
+		end
+		if ok and typeof(p) == "function" then
+			list[#list + 1] = p
+			misses = 0
+		else
+			misses = misses + 1
+			if misses >= 2 then
+				break
+			end
+		end
+	end
+	return list
+end
+
+local function upvalueAt(fn, index)
+	if typeof(getupvalue) ~= "function" then
+		return nil, nil, false
+	end
+	local ok, a, b = pcall(getupvalue, fn, index)
+	if not ok or (a == nil and b == nil) then
+		return nil, nil, false
+	end
+	if typeof(a) == "string" then
+		return a, b, true
+	end
+	return "#" .. tostring(index), a, true
+end
+
+local function upvalueCount(fn)
+	local n = 0
+	for i = 1, 80 do
+		local _, _, alive = upvalueAt(fn, i)
+		if not alive then
+			break
+		end
+		n = i
+	end
+	return n
+end
+
+local function readField(tbl, key)
+	if typeof(tbl) ~= "table" then
+		return nil
+	end
+	local raw = rawget(tbl, key)
+	if raw ~= nil then
+		return raw
+	end
+	local ok, val = pcall(function()
+		return tbl[key]
+	end)
+	if ok then
+		return val
+	end
+	return nil
+end
+
+local function describe(value)
+	if typeof(value) ~= "table" then
+		return nil
+	end
+	local direct = readField(value, "Pet Walkspeed")
+	if typeof(direct) == "number" then
+		return "direct", value, direct
+	end
+	local up = readField(value, "Upgrades")
+	if typeof(up) == "table" then
+		local level = readField(up, "Pet Walkspeed")
+		if typeof(level) == "number" then
+			return "parent", value, level, up
+		end
+	end
+	return nil
+end
+
+local function makeProxy(real)
+	return setmetatable({}, {
+		__index = function(_, key)
+			if key == "Pet Walkspeed" then
+				return 10000
+			end
+			return real[key]
+		end,
+		__newindex = function(_, key, val)
+			if key == "Pet Walkspeed" then
+				return
+			end
+			real[key] = val
+		end,
+	})
+end
+
+local function remember(fn, index, kind, parent, realUpgrades, before)
+	for i = 1, #targets do
+		if targets[i].realUpgrades == realUpgrades then
+			return false
+		end
+	end
+	local proxy = makeProxy(realUpgrades)
+	targets[#targets + 1] = {
+		fn = fn,
+		index = index,
+		kind = kind,
+		parent = parent,
+		realUpgrades = realUpgrades,
+		proxy = proxy,
+		before = before,
+	}
+	log(string.format("[UPVALUE] Trovato v113 | Upgrades.Pet Walkspeed = %s", tostring(before)))
+	return true
+end
+
+local function scanFunction(fn, how, seen, depth)
+	if typeof(fn) ~= "function" or seen[fn] or depth > 5 or isFake(fn) then
+		return
+	end
+	seen[fn] = true
+	local src = sourceOf(fn)
+	local interesting = hasConst(fn, "Pet Walkspeed") or string.find(src, "Game.Pets", 1, true) ~= nil
+	if interesting then
+		log(string.format("[FUNC] Trovata funzione: %s | upvalue: %d | via %s", cut(src, 140), upvalueCount(fn), how))
+	end
+	for i = 1, 80 do
+		local _, val, alive = upvalueAt(fn, i)
+		if not alive then
+			break
+		end
+		local kind, parent, level, up = describe(val)
+		if kind == "parent" then
+			remember(fn, i, "parent", parent, up, level)
+		elseif kind == "direct" then
+			remember(fn, i, "direct", nil, parent, level)
+		elseif typeof(val) == "function" then
+			scanFunction(val, how .. " uv", seen, depth + 1)
+		end
+	end
+	if interesting or depth == 0 then
+		local kids = childProtos(fn)
+		for i = 1, #kids do
+			scanFunction(kids[i], how .. " proto", seen, depth + 1)
+		end
+	end
+end
+
+local function connFunction(conn)
+	if typeof(conn) == "function" then
+		return conn
+	end
+	if typeof(conn) ~= "table" then
+		return nil
+	end
+	if typeof(conn.Function) == "function" then
+		return conn.Function
+	end
+	if typeof(conn.func) == "function" then
+		return conn.func
+	end
+	return nil
+end
+
+local function scanSignal(signal, label, seen)
+	if typeof(getconnections) ~= "function" then
+		log("[ERR] getconnections assente")
+		return 0
+	end
+	local ok, list = pcall(getconnections, signal)
+	if not ok or typeof(list) ~= "table" then
+		log("[ERR] getconnections " .. label .. " " .. tostring(list))
+		return 0
+	end
+	local n = 0
+	for _, conn in pairs(list) do
+		n = n + 1
+		local fn = connFunction(conn)
+		if fn then
+			scanFunction(fn, label, seen, 0)
+		end
+	end
+	log(string.format("[FUNC] %s connessioni=%d", label, n))
+	return n
+end
+
+local function scanGc(seen)
+	if typeof(getgc) ~= "function" then
+		log("[ERR] getgc assente")
+		return
+	end
+	local ok, bag = pcall(getgc, true)
+	if not ok or typeof(bag) ~= "table" then
+		log("[ERR] getgc " .. tostring(bag))
+		return
+	end
+	local seenN, fnN, hitN = 0, 0, 0
+	for _, obj in pairs(bag) do
+		seenN = seenN + 1
+		if typeof(obj) == "function" and not seen[obj] and hasConst(obj, "Pet Walkspeed") then
+			fnN = fnN + 1
+			local before = #targets
+			scanFunction(obj, "gc", seen, 0)
+			if #targets > before then
+				hitN = hitN + 1
+			end
+		end
+		if seenN % 200 == 0 then
+			task.wait()
+		end
+	end
+	log(string.format("[FUNC] gc oggetti=%d con costante=%d con upvalue=%d", seenN, fnN, hitN))
+end
+
+local restore
+
+local function search()
+	if holding or #targets > 0 then
+		restore()
+	end
+	targets = {}
+	local seen = {}
+	scanSignal(RunService.Heartbeat, "Heartbeat", seen)
+	if #targets == 0 then
+		scanSignal(RunService.RenderStepped, "RenderStepped", seen)
+	end
+	if #targets == 0 then
+		scanSignal(RunService.Stepped, "Stepped", seen)
+	end
+	if #targets == 0 then
+		scanGc(seen)
+	end
+	if #targets == 0 then
+		log("[UPVALUE] nessuno. Pet Walkspeed non e' in un upvalue raggiungibile")
+	else
+		log(string.format("[UPVALUE] tabelle=%d", #targets))
+	end
+end
+
+local function forceOne(item)
+	if item.kind == "parent" and typeof(item.parent) == "table" then
+		rawset(item.parent, "Upgrades", item.proxy)
+		return true, nil
+	end
+	if typeof(setupvalue) ~= "function" then
+		return false, "setupvalue assente"
+	end
+	local _, now = upvalueAt(item.fn, item.index)
+	if now == item.proxy then
+		return true, nil
+	end
+	local ok, err = pcall(setupvalue, item.fn, item.index, item.proxy)
+	if not ok then
+		return false, err
+	end
+	return true, nil
+end
+
+local function forceAll()
+	local okN, err
+	for i = 1, #targets do
+		local ok, why = forceOne(targets[i])
+		if ok then
+			okN = (okN or 0) + 1
+		else
+			err = why
+		end
+	end
+	return okN or 0, err
+end
+
+local function stopHold()
+	holding = false
+	if holdConn then
+		pcall(function()
+			holdConn:Disconnect()
+		end)
+		holdConn = nil
+	end
+end
+
+restore = function()
+	stopHold()
+	for i = 1, #targets do
+		local item = targets[i]
+		if item.kind == "parent" and typeof(item.parent) == "table" then
+			rawset(item.parent, "Upgrades", item.realUpgrades)
+		elseif typeof(setupvalue) == "function" then
+			pcall(setupvalue, item.fn, item.index, item.realUpgrades)
+		end
+		pcall(function()
+			item.realUpgrades["Pet Walkspeed"] = item.before
+		end)
+	end
+end
+
+local function applyBoost()
+	if not alive then
+		return
+	end
+	if #targets == 0 then
+		search()
+	end
+	if #targets == 0 then
+		log("[BOOST] Errore: v113.Upgrades non trovato")
+		return
+	end
+	local n, err = forceAll()
+	if n == 0 then
+		log("[BOOST] Errore: " .. tostring(err))
+		return
+	end
+	log("[BOOST] Pet Walkspeed impostato a 10000")
+	if holding then
+		return
+	end
+	holding = true
+	holdConn = RunService.Heartbeat:Connect(function()
+		if not alive or not holding then
+			return
+		end
+		forceAll()
+	end)
+end
+
+local function shutdown()
+	alive = false
+	restore()
+	pcall(function()
+		gui:Destroy()
+	end)
+end
+
+local pg = LocalPlayer:WaitForChild("PlayerGui")
+local old = pg:FindFirstChild("DeltaPetSpeed")
+if old then
+	pcall(function()
+		old:Destroy()
+	end)
+end
+
+gui = Instance.new("ScreenGui")
+gui.Name = "DeltaPetSpeed"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = pg
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(520, 280)
+frame.Position = UDim2.fromOffset(12, 12)
+frame.BackgroundColor3 = Color3.fromRGB(20, 24, 30)
+frame.BackgroundTransparency = 0.08
+frame.Active = true
+frame.Draggable = true
+frame.Parent = gui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 8)
+corner.Parent = frame
+
+local function button(text, x, w, color)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(w, 28)
+	b.Position = UDim2.fromOffset(x, 8)
+	b.BackgroundColor3 = color
+	b.Text = text
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.TextSize = 13
+	b.Font = Enum.Font.GothamBold
+	b.Parent = frame
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 6)
+	c.Parent = b
+	return b
+end
+
+local startBtn = button("START", 8, 84, Color3.fromRGB(50, 80, 120))
+local stopBtn = button("STOP", 98, 72, Color3.fromRGB(140, 50, 50))
+local copyBtn = button("COPIA LOG", 176, 110, Color3.fromRGB(40, 120, 50))
+local boostBtn = button("APPLICA BOOST", 292, 150, Color3.fromRGB(140, 90, 20))
+
+logBox = Instance.new("TextBox")
+logBox.Size = UDim2.new(1, -16, 1, -48)
+logBox.Position = UDim2.fromOffset(8, 42)
+logBox.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
+logBox.TextColor3 = Color3.fromRGB(210, 216, 200)
+logBox.TextSize = 13
+logBox.Font = Enum.Font.Code
+logBox.Text = "START cerca la funzione. APPLICA BOOST scrive 10000."
+logBox.TextXAlignment = Enum.TextXAlignment.Left
+logBox.TextYAlignment = Enum.TextYAlignment.Top
+logBox.TextWrapped = true
+logBox.ClearTextOnFocus = false
+logBox.TextEditable = false
+logBox.MultiLine = true
+logBox.Parent = frame
+
+startBtn.MouseButton1Click:Connect(function()
+	if not alive or scanning then
+		return
+	end
+	scanning = true
+	task.spawn(function()
+		local ok, err = pcall(search)
+		scanning = false
+		if not ok and alive then
+			log("[ERR] " .. tostring(err))
+		end
+	end)
+end)
+
+stopBtn.MouseButton1Click:Connect(function()
+	if not alive then
+		return
+	end
+	local had = #targets
+	restore()
+	if had > 0 then
+		log("[STOP] Pet Walkspeed ripristinato")
+	else
+		log("[STOP]")
 	end
 end)
 
-local gui
-do
-	local pg = LP:WaitForChild("PlayerGui")
-	local old = pg:FindFirstChild("AntiAfkDelta")
-	if old then
-		old:Destroy()
+copyBtn.MouseButton1Click:Connect(function()
+	local text = table.concat(logs, "\n")
+	if text == "" then
+		log("[COPY] log vuoto")
+		return
 	end
+	if typeof(setclip) ~= "function" then
+		log("[ERR] setclipboard assente")
+		return
+	end
+	local ok, err = pcall(setclip, text)
+	if ok then
+		log("[COPY] " .. tostring(#logs) .. " righe")
+	else
+		log("[ERR] setclipboard " .. tostring(err))
+	end
+end)
 
-	gui = Instance.new("ScreenGui")
-	gui.Name = "AntiAfkDelta"
-	gui.ResetOnSpawn = false
-	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-	gui.Parent = pg
-
-	btn = Instance.new("TextButton")
-	btn.Size = UDim2.fromOffset(92, 28)
-	btn.Position = UDim2.fromOffset(16, 16)
-	btn.BackgroundColor3 = COL_OFF
-	btn.BorderSizePixel = 0
-	btn.Font = Enum.Font.GothamBold
-	btn.TextSize = 12
-	btn.TextColor3 = Color3.fromRGB(240, 242, 248)
-	btn.Text = "AFK OFF"
-	btn.AutoButtonColor = false
-	btn.Active = true
-	btn.Draggable = true
-	btn.Parent = gui
-
-	local c = Instance.new("UICorner")
-	c.CornerRadius = UDim.new(0, 8)
-	c.Parent = btn
-
-	btn.MouseButton1Click:Connect(function()
-		if enabled then
-			stop()
-		else
-			start()
+boostBtn.MouseButton1Click:Connect(function()
+	if not alive then
+		return
+	end
+	task.spawn(function()
+		local ok, err = pcall(applyBoost)
+		if not ok and alive then
+			log("[BOOST] Errore: " .. tostring(err))
 		end
 	end)
-	paint()
-end
+end)
 
-start()
+env.__DeltaPetSpeed = {
+	stop = shutdown,
+}
 
-ENV.__AntiAfkDeltaKill = function()
-	alive = false
-	stop()
-	if gui then
-		pcall(function()
-			gui:Destroy()
-		end)
-		gui = nil
-	end
-end
+log("[READY] Delta pet speed")
