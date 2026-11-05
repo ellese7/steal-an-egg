@@ -1611,117 +1611,240 @@ local function pickNamed(named, words)
 	return bestName, bestRemote
 end
 
+local function remotePath(remote)
+	if typeof(remote) ~= "Instance" then
+		return "?"
+	end
+	local ok, full = pcall(function()
+		return remote:GetFullName()
+	end)
+	if ok and typeof(full) == "string" then
+		return full
+	end
+	return tostring(remote.Name)
+end
+
+local function claimRejected(low)
+	return string.find(low, "removed", 1, true)
+		or string.find(low, "destroy", 1, true)
+		or string.find(low, "delete", 1, true)
+		or string.find(low, "spawn", 1, true)
+		or string.find(low, "coin", 1, true)
+		or string.find(low, "pet", 1, true)
+		or string.find(low, "egg", 1, true)
+end
+
+local function claimRows(named)
+	local rows = {}
+	for name, remote in pairs(named) do
+		local low = string.lower(name)
+		if string.find(low, "orb", 1, true)
+			or string.find(low, "loot", 1, true)
+			or string.find(low, "bag", 1, true)
+			or string.find(low, "gift", 1, true)
+			or string.find(low, "collect", 1, true)
+			or string.find(low, "claim", 1, true)
+			or string.find(low, "redeem", 1, true)
+			or string.find(low, "pickup", 1, true) then
+			rows[#rows + 1] = { name = name, remote = remote, low = low }
+		end
+	end
+	table.sort(rows, function(a, b)
+		return a.name < b.name
+	end)
+	return rows
+end
+
+local function pickClaim(rows, words)
+	local best, bestScore
+	for i = 1, #rows do
+		local row = rows[i]
+		if not claimRejected(row.low) then
+			local hit = false
+			for w = 1, #words do
+				if string.find(row.low, words[w], 1, true) then
+					hit = true
+					break
+				end
+			end
+			if hit then
+				local score = 1
+				if string.find(row.low, "collect", 1, true) then
+					score = score + 5
+				end
+				if string.find(row.low, "claim", 1, true) or string.find(row.low, "redeem", 1, true) then
+					score = score + 4
+				end
+				if not bestScore or score > bestScore then
+					best, bestScore = row, score
+				end
+			end
+		end
+	end
+	return best
+end
+
 local function runClaim()
 	local network = loadNetwork()
 	local named = harvestNamedRemotes(network)
-	local orbName, orbRemote = pickNamed(named, { "orb" })
-	local bagName, bagRemote = pickNamed(named, { "lootbag", "loot" })
-	if not orbRemote then
-		orbRemote = seenClaim.Orb
+	local rows = claimRows(named)
+	if #rows == 0 then
+		log("[CLAIM] nessun nome orb/loot/gift nel Network")
 	end
-	if not bagRemote then
-		bagRemote = seenClaim.Lootbag
+	for i = 1, #rows do
+		local row = rows[i]
+		local stato = claimRejected(row.low) and "scartato" or "candidato"
+		log(string.format("[CLAIM] %s %q -> %s | hash %s", stato, row.name, remotePath(row.remote), tostring(row.remote and row.remote.Name)))
+	end
+	local bagRow = pickClaim(rows, { "lootbag", "loot" })
+	local giftRow = pickClaim(rows, { "gift" })
+	local orbRow = pickClaim(rows, { "orb" })
+	local bagName = bagRow and bagRow.name or nil
+	local bagRemote = (bagRow and bagRow.remote) or seenClaim.Lootbag
+	local giftName = giftRow and giftRow.name or nil
+	local giftRemote = giftRow and giftRow.remote or nil
+	local orbName = orbRow and orbRow.name or nil
+	local orbRemote = (orbRow and orbRow.remote) or nil
+	if not orbRemote and seenClaim.Orb then
+		local skip = false
+		for i = 1, #rows do
+			if rows[i].remote == seenClaim.Orb and claimRejected(rows[i].low) then
+				skip = true
+				break
+			end
+		end
+		if not skip then
+			orbRemote = seenClaim.Orb
+			log("[CLAIM] Orb dal remote visto in gioco -> " .. remotePath(orbRemote) .. " | hash " .. tostring(orbRemote.Name))
+		end
 	end
 	local things = game:GetService("Workspace"):FindFirstChild("__THINGS")
-	local orbFolder = things and things:FindFirstChild("Orbs")
-	local bagFolder = things and things:FindFirstChild("Lootbags")
+	if things then
+		local folders = things:GetChildren()
+		local shown = {}
+		for i = 1, #folders do
+			shown[i] = folders[i].Name .. ":" .. tostring(#folders[i]:GetChildren())
+		end
+		log("[CLAIM] __THINGS " .. table.concat(shown, ", "))
+	else
+		log("[CLAIM] __THINGS assente")
+	end
 	local function send(name, remote, ...)
+		local preview = {}
+		local n = select("#", ...)
+		for i = 1, n do
+			preview[i] = dumpValue(select(i, ...), 0)
+		end
+		local via = remotePath(remote)
+		log(string.format("[CLAIM] Fire %q -> %s | hash %s | args %s", tostring(name), via, tostring(remote and remote.Name), table.concat(preview, ", ")))
 		if name and network and typeof(network.Fire) == "function" then
 			local ok, err = pcall(network.Fire, name, ...)
 			if ok then
-				return "nome " .. name
+				return true
 			end
-			log("[CLAIM] Fire " .. name .. " fallito " .. tostring(err))
+			log("[CLAIM] Fire nome fallito " .. tostring(err))
 		end
 		if remote then
-			remote:FireServer(...)
-			return "remote " .. remote.Name
-		end
-		return nil
-	end
-	local orbKids = orbFolder and orbFolder:GetChildren() or {}
-	local ids = {}
-	for i = 1, #orbKids do
-		local drop = orbKids[i]
-		if drop.Parent then
-			ids[#ids + 1] = drop.Name
-		end
-	end
-	if not orbName and not orbRemote then
-		log("[CLAIM] Orb remote non trovato")
-	elseif #ids == 0 then
-		log("[CLAIM] nessun Orb")
-	else
-		local label = send(orbName, orbRemote, ids)
-		if not label then
-			log("[CLAIM] Orb non inviato")
-		else
-			task.wait(1)
-			local gone = 0
-			for i = 1, #orbKids do
-				if orbKids[i].Parent == nil then
-					gone = gone + 1
-				end
+			local ok, err = pcall(function(...)
+				remote:FireServer(...)
+			end, ...)
+			if ok then
+				return true
 			end
-			log(string.format("[CLAIM] Orb via %s | inviate %d | sparite %d", label, #ids, gone))
+			log("[CLAIM] FireServer fallito " .. tostring(err))
 		end
+		return false
 	end
-	local bagKids = bagFolder and bagFolder:GetChildren() or {}
-	local bags = {}
-	for i = 1, #bagKids do
-		local drop = bagKids[i]
-		if drop.Parent then
-			bags[#bags + 1] = drop
+	local function dropsOf(folder)
+		local list = {}
+		if not folder then
+			return list
 		end
+		local kids = folder:GetChildren()
+		for i = 1, #kids do
+			if kids[i].Parent then
+				list[#list + 1] = kids[i]
+			end
+		end
+		return list
 	end
-	if not bagName and not bagRemote then
-		log("[CLAIM] Lootbag remote non trovato")
-	elseif #bags == 0 then
-		log("[CLAIM] nessun Lootbag")
-	else
-		local label
+	local function fireDrops(kind, name, remote, folder, withPos)
+		local drops = dropsOf(folder)
+		if not name and not remote then
+			log("[CLAIM] " .. kind .. " remote assente")
+			return
+		end
+		if #drops == 0 then
+			log("[CLAIM] nessun " .. kind)
+			return
+		end
 		local sent = 0
-		for i = 1, #bags do
-			local drop = bags[i]
+		for i = 1, #drops do
+			local drop = drops[i]
 			local pos = dropPosition(drop)
-			if pos and drop.Parent then
-				local one = send(bagName, bagRemote, drop.Name, pos)
-				if one then
-					label = one
+			if drop.Parent and (not withPos or pos) then
+				local ok
+				if withPos then
+					ok = send(name, remote, drop.Name, pos)
+				else
+					ok = send(name, remote, { drop.Name })
+				end
+				if ok then
 					sent = sent + 1
 				end
 			end
 		end
-		if sent == 0 then
-			log("[CLAIM] Lootbag non inviato")
-		else
-			task.wait(1)
-			local gone = 0
-			for i = 1, #bags do
-				if bags[i].Parent == nil then
-					gone = gone + 1
-				end
-			end
-			log(string.format("[CLAIM] Lootbag via %s | inviati %d | spariti %d", label, sent, gone))
-		end
-	end
-	if not orbRemote and not bagRemote then
-		local hints = {}
-		for name in pairs(named) do
-			local low = string.lower(name)
-			if string.find(low, "orb", 1, true) or string.find(low, "loot", 1, true) or string.find(low, "bag", 1, true) or string.find(low, "collect", 1, true) or string.find(low, "pickup", 1, true) then
-				hints[#hints + 1] = name
-				if #hints >= 8 then
-					break
-				end
+		task.wait(2)
+		local gone = 0
+		for i = 1, #drops do
+			if drops[i].Parent == nil then
+				gone = gone + 1
 			end
 		end
-		if #hints > 0 then
-			log("[CLAIM] candidati: " .. table.concat(hints, ", "))
-		else
-			log("[CLAIM] nel Network non c'e' un nome orb/loot. Premi START, raccogli un drop a mano, poi RISCATTA.")
-		end
+		log(string.format("[CLAIM] %s inviati %d | spariti %d | ancora a terra %d", kind, sent, gone, #drops - gone))
 	end
+	local function fireOrbs()
+		local folder = things and things:FindFirstChild("Orbs")
+		local drops = dropsOf(folder)
+		if not orbName and not orbRemote then
+			log("[CLAIM] Orb collect assente. Orb Removed non viene usato: non raccoglie.")
+			return
+		end
+		if #drops == 0 then
+			log("[CLAIM] nessun Orb")
+			return
+		end
+		local ids = {}
+		for i = 1, #drops do
+			ids[i] = drops[i].Name
+		end
+		local sent = 0
+		local step = 30
+		for i = 1, #ids, step do
+			local batch = {}
+			for j = i, math.min(i + step - 1, #ids) do
+				batch[#batch + 1] = ids[j]
+			end
+			if send(orbName, orbRemote, batch) then
+				sent = sent + #batch
+			end
+		end
+		task.wait(1.5)
+		local gone = 0
+		for i = 1, #drops do
+			if drops[i].Parent == nil then
+				gone = gone + 1
+			end
+		end
+		log(string.format("[CLAIM] Orb inviate %d | sparite %d | ancora a terra %d", sent, gone, #drops - gone))
+	end
+	fireDrops("Lootbag", bagName, bagRemote, things and things:FindFirstChild("Lootbags"), true)
+	if giftName and giftRemote and giftRemote ~= bagRemote then
+		local giftFolder = things and (things:FindFirstChild("Gifts") or things:FindFirstChild("Giftbags") or things:FindFirstChild("GiftBags"))
+		fireDrops("Gift", giftName, giftRemote, giftFolder, true)
+	end
+	task.wait(1)
+	fireOrbs()
 end
 
 local function shutdown()
