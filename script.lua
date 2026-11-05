@@ -1218,6 +1218,263 @@ local function runCollectTest()
 	end)
 end
 
+local function sharedEnv()
+	local genv = _G
+	pcall(function()
+		if typeof(getgenv) == "function" then
+			genv = getgenv()
+		end
+	end)
+	return genv
+end
+
+local function readableName(text)
+	return typeof(text) == "string" and text ~= "" and not isHexHash(text) and string.match(text, "%a") ~= nil
+end
+
+local function mapHashName(hash)
+	local rs = game:GetService("ReplicatedStorage")
+	local library = rs:FindFirstChild("Library")
+	local module = library and library:FindFirstChild("Network")
+	local network
+	local requireOk = false
+	if module then
+		local ok, loaded = pcall(require, module)
+		if ok and typeof(loaded) == "table" then
+			network = loaded
+			requireOk = true
+		end
+	end
+	local foundName
+	local function consider(name)
+		if not foundName and readableName(name) then
+			foundName = name
+		end
+	end
+	if requireOk then
+		local seen = {}
+		local function walk(value, depth)
+			if foundName or depth > 6 or value == nil or seen[value] then
+				return
+			end
+			local kind = typeof(value)
+			if kind == "table" then
+				seen[value] = true
+				pcall(function()
+					for key, item in pairs(value) do
+						local keyText = typeof(key) == "string" and key or nil
+						if isHexHash(item) and item == hash then
+							consider(keyText)
+						elseif isHexHash(keyText) and keyText == hash then
+							consider(item)
+						elseif typeof(item) == "Instance" and item.Name == hash then
+							consider(keyText)
+						end
+						if typeof(item) == "table" or typeof(item) == "function" then
+							walk(item, depth + 1)
+						end
+					end
+				end)
+			elseif kind == "function" then
+				seen[value] = true
+				if typeof(getconstants) == "function" then
+					local okConst, consts = pcall(getconstants, value)
+					if okConst and typeof(consts) == "table" then
+						local hasHash = false
+						local names = {}
+						for _, c in pairs(consts) do
+							if c == hash then
+								hasHash = true
+							elseif readableName(c) then
+								names[#names + 1] = c
+							end
+						end
+						if hasHash then
+							consider(names[1])
+						end
+					end
+				end
+				for i = 1, 30 do
+					local _, up, aliveUp = upvalueAt(value, i)
+					if not aliveUp then
+						break
+					end
+					walk(up, depth + 1)
+				end
+			end
+		end
+		walk(network, 0)
+	end
+	if not foundName then
+		local remote = rs:FindFirstChild(hash)
+		local getconns = api("getconnections")
+		if typeof(remote) == "Instance" and remote:IsA("RemoteEvent") and typeof(getconns) == "function" then
+			local okConn, conns = pcall(getconns, remote.OnClientEvent)
+			if okConn and typeof(conns) == "table" then
+				for _, conn in pairs(conns) do
+					local fn = typeof(conn) == "function" and conn or (typeof(conn) == "table" and (conn.Function or conn.func))
+					if typeof(fn) == "function" and typeof(getconstants) == "function" then
+						local okConst, consts = pcall(getconstants, fn)
+						if okConst and typeof(consts) == "table" then
+							for _, c in pairs(consts) do
+								if readableName(c) then
+									local low = string.lower(c)
+									if string.find(low, "orb", 1, true) or string.find(low, "loot", 1, true) or string.find(low, "bag", 1, true) or string.find(low, "collect", 1, true) then
+										consider(c)
+									end
+								end
+							end
+						end
+					end
+					if foundName then
+						break
+					end
+				end
+			end
+		end
+	end
+	local remote = rs:FindFirstChild(hash)
+	if typeof(remote) ~= "Instance" or not remote:IsA("RemoteEvent") then
+		remote = nil
+	end
+	if foundName then
+		log("[MAP] Hash " .. hash .. " -> " .. foundName)
+	else
+		log("[MAP] Mappatura non trovata")
+	end
+	return network, foundName, remote
+end
+
+local function pauseGameOrbs()
+	local paused = {}
+	local scripts = LocalPlayer:FindFirstChild("PlayerScripts")
+	if not scripts then
+		return paused
+	end
+	local list = scripts:GetDescendants()
+	for i = 1, #list do
+		local inst = list[i]
+		if inst:IsA("LocalScript") and inst.Name == "Orbs" and not inst.Disabled then
+			inst.Disabled = true
+			paused[#paused + 1] = inst
+		end
+	end
+	return paused
+end
+
+local function resumeGameOrbs(paused)
+	for i = 1, #paused do
+		local inst = paused[i]
+		if inst.Parent then
+			inst.Disabled = false
+		end
+	end
+end
+
+local function runCleanCollectTest()
+	local genv = sharedEnv()
+	genv.DisableAutoCollect = true
+	local paused = pauseGameOrbs()
+	local function finish()
+		genv.DisableAutoCollect = false
+		resumeGameOrbs(paused)
+	end
+	local okRun, runErr = pcall(function()
+		local network, orbName, orbRemote = mapHashName(ORB_HASH)
+		local _, bagName, bagRemote = mapHashName(BAG_HASH)
+		local things = game:GetService("Workspace"):FindFirstChild("__THINGS")
+		local orbFolder = things and things:FindFirstChild("Orbs")
+		local bagFolder = things and things:FindFirstChild("Lootbags")
+		local function fireOrb(id)
+			if orbName and network and typeof(network.Fire) == "function" then
+				network.Fire(orbName, { id })
+				return
+			end
+			if orbRemote then
+				orbRemote:FireServer({ id })
+			end
+		end
+		local function fireBag(id, pos)
+			if bagName and network and typeof(network.Fire) == "function" then
+				network.Fire(bagName, id, pos)
+				return
+			end
+			if bagRemote then
+				bagRemote:FireServer(id, pos)
+			end
+		end
+		local function settle(drop, studs)
+			local origin = dropPosition(drop)
+			local root = playerRoot()
+			if not origin or not root or drop.Parent == nil then
+				return nil
+			end
+			root.CFrame = CFrame.new(origin + Vector3.new(studs, 0, 0))
+			task.wait(3)
+			if drop.Parent == nil then
+				return nil
+			end
+			local now = dropPosition(drop)
+			local rootNow = playerRoot() or root
+			local moved = (now and origin) and (now - origin).Magnitude or 0
+			local away = now and (rootNow.Position - now).Magnitude or 0
+			return now, away, moved
+		end
+		for n = 1, 3 do
+			local drop = orbFolder and orbFolder:GetChildren()[1]
+			if not drop then
+				log("[TEST_ORB] nessun Orb")
+				break
+			end
+			local id = drop.Name
+			local pos, away, moved = settle(drop, 100)
+			if not pos then
+				log("[TEST_ORB] Orb sparita prima della chiamata")
+			else
+				if moved > 2 then
+					log(string.format("[TEST_ORB] Orb spostata di %.1f stud durante l'attesa, magnete ancora attivo", moved))
+				end
+				local okSend, sendErr = pcall(fireOrb, id)
+				if not okSend then
+					log("[TEST_ORB] invio fallito " .. tostring(sendErr))
+				else
+					task.wait(1)
+					local gone = drop.Parent == nil
+					log(string.format("[TEST_ORB] Distanza: %.0f stud | Orb sparita: %s", away, tostring(gone)))
+				end
+			end
+		end
+		for _, studs in ipairs({ 10, 20, 30, 50 }) do
+			local drop = bagFolder and bagFolder:GetChildren()[1]
+			if not drop then
+				log("[TEST_LOOTBAG] nessun Lootbag")
+				break
+			end
+			local id = drop.Name
+			local pos, away, moved = settle(drop, studs)
+			if not pos then
+				log("[TEST_LOOTBAG] Lootbag sparito prima della chiamata")
+			else
+				if moved > 2 then
+					log(string.format("[TEST_LOOTBAG] Bag spostato di %.1f stud durante l'attesa, magnete ancora attivo", moved))
+				end
+				local okSend, sendErr = pcall(fireBag, id, pos)
+				if not okSend then
+					log("[TEST_LOOTBAG] invio fallito " .. tostring(sendErr))
+				else
+					task.wait(1)
+					local gone = drop.Parent == nil
+					log(string.format("[TEST_LOOTBAG] Distanza: %.0f stud | Bag sparito: %s", away, tostring(gone)))
+				end
+			end
+		end
+	end)
+	finish()
+	if not okRun then
+		error(runErr)
+	end
+end
+
 local function shutdown()
 	alive = false
 	setSpy(false)
@@ -1288,6 +1545,20 @@ testBtn.Parent = gui
 local testCorner = Instance.new("UICorner")
 testCorner.CornerRadius = UDim.new(0, 6)
 testCorner.Parent = testBtn
+
+local cleanBtn = Instance.new("TextButton")
+cleanBtn.Name = "TestPulito"
+cleanBtn.Size = UDim2.fromOffset(140, 28)
+cleanBtn.Position = UDim2.fromOffset(480, 46)
+cleanBtn.BackgroundColor3 = Color3.fromRGB(40, 90, 110)
+cleanBtn.Text = "TEST PULITO"
+cleanBtn.TextColor3 = Color3.new(1, 1, 1)
+cleanBtn.TextSize = 13
+cleanBtn.Font = Enum.Font.GothamBold
+cleanBtn.Parent = gui
+local cleanCorner = Instance.new("UICorner")
+cleanCorner.CornerRadius = UDim.new(0, 6)
+cleanCorner.Parent = cleanBtn
 
 logScroll = Instance.new("ScrollingFrame")
 logScroll.Size = UDim2.new(1, -16, 1, -48)
@@ -1457,6 +1728,20 @@ testBtn.MouseButton1Click:Connect(function()
 		testBusy = false
 		if not ok and alive then
 			log("[TEST] " .. tostring(err))
+		end
+	end)
+end)
+
+cleanBtn.MouseButton1Click:Connect(function()
+	if not alive or testBusy then
+		return
+	end
+	testBusy = true
+	task.spawn(function()
+		local ok, err = pcall(runCleanCollectTest)
+		testBusy = false
+		if not ok and alive then
+			log("[TEST_ORB] " .. tostring(err))
 		end
 	end)
 end)
