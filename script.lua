@@ -1010,6 +1010,214 @@ local function scanRemotes()
 	log(string.format("[REMOTE] scan remoti=%d sospetti=%d", total, shown))
 end
 
+local ORB_HASH = "dd6b06ed6c49492a26678b848e3dd8c9"
+local BAG_HASH = "aa4e3b0fdcd344e764c48257a73ebae4"
+local testBusy = false
+
+local function isHexHash(text)
+	return typeof(text) == "string" and #text >= 16 and string.match(text, "^%x+$") ~= nil
+end
+
+local function noteMap(found, hash, name, remote)
+	if not isHexHash(hash) then
+		return
+	end
+	local row = found[hash]
+	if not row then
+		row = {}
+		found[hash] = row
+	end
+	if typeof(name) == "string" and name ~= "" and not isHexHash(name) then
+		row.name = name
+	end
+	if typeof(remote) == "Instance" and (remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction") or remote:IsA("UnreliableRemoteEvent")) then
+		row.remote = remote
+		if isHexHash(remote.Name) then
+			row.hash = remote.Name
+		end
+	end
+end
+
+local function walkMap(value, seen, depth, found)
+	if depth > 5 or value == nil or seen[value] then
+		return
+	end
+	local kind = typeof(value)
+	if kind == "table" then
+		seen[value] = true
+		pcall(function()
+			for key, item in pairs(value) do
+				local keyText = typeof(key) == "string" and key or nil
+				if typeof(item) == "Instance" then
+					noteMap(found, item.Name, keyText, item)
+					noteMap(found, keyText, nil, item)
+				elseif isHexHash(item) and keyText then
+					noteMap(found, item, keyText, nil)
+				elseif isHexHash(keyText) and typeof(item) == "string" then
+					noteMap(found, keyText, item, nil)
+				end
+				if typeof(item) == "table" or typeof(item) == "function" then
+					walkMap(item, seen, depth + 1, found)
+				end
+			end
+		end)
+	elseif kind == "function" then
+		seen[value] = true
+		for i = 1, 25 do
+			local _, up, aliveUp = upvalueAt(value, i)
+			if not aliveUp then
+				break
+			end
+			if typeof(up) == "table" or typeof(up) == "function" or typeof(up) == "Instance" then
+				walkMap(up, seen, depth + 1, found)
+			end
+		end
+	elseif kind == "Instance" then
+		noteMap(found, value.Name, nil, value)
+	end
+end
+
+local function mapCollectRemotes()
+	local rs = game:GetService("ReplicatedStorage")
+	local library = rs:FindFirstChild("Library")
+	local module = library and library:FindFirstChild("Network")
+	local network
+	if module then
+		local ok, loaded = pcall(require, module)
+		if ok and typeof(loaded) == "table" then
+			network = loaded
+		end
+	end
+	local found = {}
+	local seen = {}
+	local getsenv = api("getsenv")
+	if module and typeof(getsenv) == "function" then
+		local ok, env = pcall(getsenv, module)
+		if ok and typeof(env) == "table" then
+			walkMap(env, seen, 0, found)
+		else
+			log("[MAP] getsenv senza ambiente")
+		end
+	else
+		log("[MAP] getsenv assente")
+	end
+	if network then
+		walkMap(network, seen, 0, found)
+	end
+	local function remoteOf(hash)
+		local row = found[hash]
+		if row and row.remote then
+			return row.remote
+		end
+		local inst = rs:FindFirstChild(hash)
+		if typeof(inst) == "Instance" and inst:IsA("RemoteEvent") then
+			return inst
+		end
+		return nil
+	end
+	local function report(label, hash)
+		local row = found[hash]
+		local name = row and row.name or nil
+		local remote = remoteOf(hash)
+		if name then
+			log("[MAP] " .. label .. " -> " .. name)
+		elseif remote then
+			log("[MAP] " .. label .. " -> hash " .. hash .. " senza nome")
+		else
+			log("[MAP] " .. label .. " -> hash assente in questa sessione")
+		end
+		return name, remote
+	end
+	local orbName, orbRemote = report("OrbRemote", ORB_HASH)
+	local bagName, bagRemote = report("LootbagRemote", BAG_HASH)
+	return network, orbName, orbRemote, bagName, bagRemote
+end
+
+local function dropPosition(inst)
+	if inst:IsA("BasePart") then
+		return inst.Position
+	end
+	if inst:IsA("Model") then
+		return inst:GetPivot().Position
+	end
+	local part = inst:FindFirstChildWhichIsA("BasePart", true)
+	return part and part.Position or nil
+end
+
+local function playerRoot()
+	local char = LocalPlayer.Character
+	return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function runCollectTest()
+	local network, orbName, orbRemote, bagName, bagRemote = mapCollectRemotes()
+	local things = game:GetService("Workspace"):FindFirstChild("__THINGS")
+	local orbs = things and things:FindFirstChild("Orbs")
+	local bags = things and things:FindFirstChild("Lootbags")
+	local function sendOrb(id)
+		if orbName and network and typeof(network.Fire) == "function" then
+			network.Fire(orbName, { id })
+			return orbName
+		end
+		if orbRemote then
+			orbRemote:FireServer({ id })
+			return orbRemote.Name
+		end
+		return nil
+	end
+	local function sendBag(id, pos)
+		if bagName and network and typeof(network.Fire) == "function" then
+			network.Fire(bagName, id, pos)
+			return bagName
+		end
+		if bagRemote then
+			bagRemote:FireServer(id, pos)
+			return bagRemote.Name
+		end
+		return nil
+	end
+	local function probe(kind, folder, send)
+		local drop = folder and folder:GetChildren()[1]
+		if not drop then
+			log("[TEST] nessun " .. kind)
+			return
+		end
+		local pos = dropPosition(drop)
+		local root = playerRoot()
+		if not pos or not root then
+			log("[TEST] " .. kind .. " senza posizione")
+			return
+		end
+		root.CFrame = CFrame.new(pos + Vector3.new(50, 5, 0))
+		task.wait(0.3)
+		root = playerRoot() or root
+		local away = (root.Position - pos).Magnitude
+		local label
+		local okSend, sendErr = pcall(function()
+			label = send(drop.Name, pos)
+		end)
+		if not okSend then
+			log("[TEST] invio " .. kind .. " fallito " .. tostring(sendErr))
+			return
+		end
+		if not label then
+			log("[TEST] remote " .. kind .. " assente")
+			return
+		end
+		task.wait(1)
+		root = playerRoot() or root
+		local still = drop.Parent ~= nil
+		log(string.format("[TEST] Distanza attuale: %.1f stud | Remote: %s | Drop sparito: %s", away, label, tostring(not still)))
+		log("[TEST] Drop ancora a terra: " .. tostring(still))
+	end
+	probe("Orb", orbs, function(id)
+		return sendOrb(id)
+	end)
+	probe("Lootbag", bags, function(id, pos)
+		return sendBag(id, pos)
+	end)
+end
+
 local function shutdown()
 	alive = false
 	setSpy(false)
@@ -1066,6 +1274,20 @@ local startBtn = button("START", 8, 84, Color3.fromRGB(50, 80, 120))
 local stopBtn = button("STOP", 98, 72, Color3.fromRGB(140, 50, 50))
 local copyBtn = button("COPIA LOG", 176, 110, Color3.fromRGB(40, 120, 50))
 local boostBtn = button("BOOST SPEED", 292, 150, Color3.fromRGB(140, 90, 20))
+
+local testBtn = Instance.new("TextButton")
+testBtn.Name = "TestCollect"
+testBtn.Size = UDim2.fromOffset(140, 28)
+testBtn.Position = UDim2.fromOffset(480, 12)
+testBtn.BackgroundColor3 = Color3.fromRGB(90, 50, 140)
+testBtn.Text = "TEST COLLECT"
+testBtn.TextColor3 = Color3.new(1, 1, 1)
+testBtn.TextSize = 13
+testBtn.Font = Enum.Font.GothamBold
+testBtn.Parent = gui
+local testCorner = Instance.new("UICorner")
+testCorner.CornerRadius = UDim.new(0, 6)
+testCorner.Parent = testBtn
 
 logScroll = Instance.new("ScrollingFrame")
 logScroll.Size = UDim2.new(1, -16, 1, -48)
@@ -1221,6 +1443,20 @@ boostBtn.MouseButton1Click:Connect(function()
 		local ok, err = pcall(applyBoost)
 		if not ok and alive then
 			log("[BOOST] Errore: " .. tostring(err))
+		end
+	end)
+end)
+
+testBtn.MouseButton1Click:Connect(function()
+	if not alive or testBusy then
+		return
+	end
+	testBusy = true
+	task.spawn(function()
+		local ok, err = pcall(runCollectTest)
+		testBusy = false
+		if not ok and alive then
+			log("[TEST] " .. tostring(err))
 		end
 	end)
 end)
