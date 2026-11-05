@@ -757,6 +757,8 @@ local function spyBox()
 	return box
 end
 
+local seenClaim = {}
+
 local function setSpy(flag)
 	spyOn = flag
 	spyBox().on = flag
@@ -863,6 +865,16 @@ local function logFire(self, ...)
 			mark = " HIT " .. table.concat(hits.drops, " | ")
 		end
 		log("[COLLECT] " .. path .. mark .. " | Args: " .. table.concat(shown, ", "))
+		if typeof(self) == "Instance" and self:IsA("RemoteEvent") then
+			for i = 1, #hits.drops do
+				local label = hits.drops[i]
+				if string.sub(label, 1, 4) == "Orb " then
+					seenClaim.Orb = self
+				elseif string.sub(label, 1, 8) == "Lootbag " then
+					seenClaim.Lootbag = self
+				end
+			end
+		end
 	end
 	local counts = {}
 	local detour = newcclosure(function(self, ...)
@@ -1475,6 +1487,243 @@ local function runCleanCollectTest()
 	end
 end
 
+local function loadNetwork()
+	local rs = game:GetService("ReplicatedStorage")
+	local library = rs:FindFirstChild("Library")
+	local module = library and library:FindFirstChild("Network")
+	if not module then
+		return nil
+	end
+	local ok, loaded = pcall(require, module)
+	if ok and typeof(loaded) == "table" then
+		return loaded
+	end
+	return nil
+end
+
+local function harvestNamedRemotes(network)
+	local rs = game:GetService("ReplicatedStorage")
+	local named = {}
+	local seen = {}
+	local function add(name, remote)
+		if not readableName(name) then
+			return
+		end
+		if typeof(remote) == "Instance" and remote:IsA("RemoteEvent") then
+			named[name] = remote
+		end
+	end
+	local function resolveHash(hash)
+		if not isHexHash(hash) then
+			return nil
+		end
+		local inst = rs:FindFirstChild(hash)
+		if typeof(inst) == "Instance" and inst:IsA("RemoteEvent") then
+			return inst
+		end
+		return nil
+	end
+	local function walk(value, depth)
+		if depth > 6 or value == nil or seen[value] then
+			return
+		end
+		local kind = typeof(value)
+		if kind == "table" then
+			seen[value] = true
+			pcall(function()
+				for key, item in pairs(value) do
+					local keyText = typeof(key) == "string" and key or nil
+					if typeof(item) == "Instance" then
+						add(keyText, item)
+					elseif isHexHash(item) and keyText then
+						add(keyText, resolveHash(item))
+					elseif isHexHash(keyText) and typeof(item) == "string" then
+						add(item, resolveHash(keyText))
+					end
+					if typeof(item) == "table" or typeof(item) == "function" then
+						walk(item, depth + 1)
+					end
+				end
+			end)
+		elseif kind == "function" then
+			seen[value] = true
+			for i = 1, 30 do
+				local _, up, aliveUp = upvalueAt(value, i)
+				if not aliveUp then
+					break
+				end
+				if typeof(up) == "table" or typeof(up) == "function" or typeof(up) == "Instance" then
+					walk(up, depth + 1)
+				end
+			end
+			if typeof(getconstants) == "function" then
+				local okConst, consts = pcall(getconstants, value)
+				if okConst and typeof(consts) == "table" then
+					local hashes = {}
+					local names = {}
+					for _, c in pairs(consts) do
+						if isHexHash(c) then
+							hashes[#hashes + 1] = c
+						elseif readableName(c) then
+							names[#names + 1] = c
+						end
+					end
+					if #hashes == 1 and #names == 1 then
+						add(names[1], resolveHash(hashes[1]))
+					end
+				end
+			end
+		elseif kind == "Instance" then
+			seen[value] = true
+		end
+	end
+	if typeof(network) == "table" then
+		walk(network, 0)
+		if typeof(network.Fire) == "function" then
+			walk(network.Fire, 0)
+		end
+	end
+	return named
+end
+
+local function nameScore(name, words)
+	local low = string.lower(name)
+	if string.find(low, "coin", 1, true) or string.find(low, "pet", 1, true) or string.find(low, "egg", 1, true) then
+		return -1
+	end
+	local score = 0
+	for i = 1, #words do
+		if string.find(low, words[i], 1, true) then
+			score = score + 1
+		end
+	end
+	return score
+end
+
+local function pickNamed(named, words)
+	local bestName, bestRemote, bestScore
+	for name, remote in pairs(named) do
+		local score = nameScore(name, words)
+		if score > 0 and (not bestScore or score > bestScore) then
+			bestName, bestRemote, bestScore = name, remote, score
+		end
+	end
+	return bestName, bestRemote
+end
+
+local function runClaim()
+	local network = loadNetwork()
+	local named = harvestNamedRemotes(network)
+	local orbName, orbRemote = pickNamed(named, { "orb" })
+	local bagName, bagRemote = pickNamed(named, { "lootbag", "loot" })
+	if not orbRemote then
+		orbRemote = seenClaim.Orb
+	end
+	if not bagRemote then
+		bagRemote = seenClaim.Lootbag
+	end
+	local things = game:GetService("Workspace"):FindFirstChild("__THINGS")
+	local orbFolder = things and things:FindFirstChild("Orbs")
+	local bagFolder = things and things:FindFirstChild("Lootbags")
+	local function send(name, remote, ...)
+		if name and network and typeof(network.Fire) == "function" then
+			local ok, err = pcall(network.Fire, name, ...)
+			if ok then
+				return "nome " .. name
+			end
+			log("[CLAIM] Fire " .. name .. " fallito " .. tostring(err))
+		end
+		if remote then
+			remote:FireServer(...)
+			return "remote " .. remote.Name
+		end
+		return nil
+	end
+	local orbKids = orbFolder and orbFolder:GetChildren() or {}
+	local ids = {}
+	for i = 1, #orbKids do
+		local drop = orbKids[i]
+		if drop.Parent then
+			ids[#ids + 1] = drop.Name
+		end
+	end
+	if not orbName and not orbRemote then
+		log("[CLAIM] Orb remote non trovato")
+	elseif #ids == 0 then
+		log("[CLAIM] nessun Orb")
+	else
+		local label = send(orbName, orbRemote, ids)
+		if not label then
+			log("[CLAIM] Orb non inviato")
+		else
+			task.wait(1)
+			local gone = 0
+			for i = 1, #orbKids do
+				if orbKids[i].Parent == nil then
+					gone = gone + 1
+				end
+			end
+			log(string.format("[CLAIM] Orb via %s | inviate %d | sparite %d", label, #ids, gone))
+		end
+	end
+	local bagKids = bagFolder and bagFolder:GetChildren() or {}
+	local bags = {}
+	for i = 1, #bagKids do
+		local drop = bagKids[i]
+		if drop.Parent then
+			bags[#bags + 1] = drop
+		end
+	end
+	if not bagName and not bagRemote then
+		log("[CLAIM] Lootbag remote non trovato")
+	elseif #bags == 0 then
+		log("[CLAIM] nessun Lootbag")
+	else
+		local label
+		local sent = 0
+		for i = 1, #bags do
+			local drop = bags[i]
+			local pos = dropPosition(drop)
+			if pos and drop.Parent then
+				local one = send(bagName, bagRemote, drop.Name, pos)
+				if one then
+					label = one
+					sent = sent + 1
+				end
+			end
+		end
+		if sent == 0 then
+			log("[CLAIM] Lootbag non inviato")
+		else
+			task.wait(1)
+			local gone = 0
+			for i = 1, #bags do
+				if bags[i].Parent == nil then
+					gone = gone + 1
+				end
+			end
+			log(string.format("[CLAIM] Lootbag via %s | inviati %d | spariti %d", label, sent, gone))
+		end
+	end
+	if not orbRemote and not bagRemote then
+		local hints = {}
+		for name in pairs(named) do
+			local low = string.lower(name)
+			if string.find(low, "orb", 1, true) or string.find(low, "loot", 1, true) or string.find(low, "bag", 1, true) or string.find(low, "collect", 1, true) or string.find(low, "pickup", 1, true) then
+				hints[#hints + 1] = name
+				if #hints >= 8 then
+					break
+				end
+			end
+		end
+		if #hints > 0 then
+			log("[CLAIM] candidati: " .. table.concat(hints, ", "))
+		else
+			log("[CLAIM] nel Network non c'e' un nome orb/loot. Premi START, raccogli un drop a mano, poi RISCATTA.")
+		end
+	end
+end
+
 local function shutdown()
 	alive = false
 	setSpy(false)
@@ -1537,7 +1786,7 @@ testBtn.Name = "TestCollect"
 testBtn.Size = UDim2.fromOffset(140, 28)
 testBtn.Position = UDim2.fromOffset(480, 12)
 testBtn.BackgroundColor3 = Color3.fromRGB(90, 50, 140)
-testBtn.Text = "TEST COLLECT"
+testBtn.Text = "RISCATTA"
 testBtn.TextColor3 = Color3.new(1, 1, 1)
 testBtn.TextSize = 13
 testBtn.Font = Enum.Font.GothamBold
@@ -1551,7 +1800,8 @@ cleanBtn.Name = "TestPulito"
 cleanBtn.Size = UDim2.fromOffset(140, 28)
 cleanBtn.Position = UDim2.fromOffset(480, 46)
 cleanBtn.BackgroundColor3 = Color3.fromRGB(40, 90, 110)
-cleanBtn.Text = "TEST PULITO"
+cleanBtn.Visible = false
+cleanBtn.Text = "RISCATTA"
 cleanBtn.TextColor3 = Color3.new(1, 1, 1)
 cleanBtn.TextSize = 13
 cleanBtn.Font = Enum.Font.GothamBold
@@ -1724,10 +1974,10 @@ testBtn.MouseButton1Click:Connect(function()
 	end
 	testBusy = true
 	task.spawn(function()
-		local ok, err = pcall(runCollectTest)
+		local ok, err = pcall(runClaim)
 		testBusy = false
 		if not ok and alive then
-			log("[TEST] " .. tostring(err))
+			log("[CLAIM] " .. tostring(err))
 		end
 	end)
 end)
@@ -1738,10 +1988,10 @@ cleanBtn.MouseButton1Click:Connect(function()
 	end
 	testBusy = true
 	task.spawn(function()
-		local ok, err = pcall(runCleanCollectTest)
+		local ok, err = pcall(runClaim)
 		testBusy = false
 		if not ok and alive then
-			log("[TEST_ORB] " .. tostring(err))
+			log("[CLAIM] " .. tostring(err))
 		end
 	end)
 end)
