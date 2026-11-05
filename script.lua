@@ -2,6 +2,33 @@
 -- getconnections, getgc, debug.getupvalue, debug.setupvalue.
 -- v113 non viene sostituito. Si fissa la tabella Upgrades che la funzione legge.
 
+local function namecallNow()
+	local grm = getrawmetatable
+	if type(grm) ~= "function" and type(getgenv) == "function" then
+		grm = getgenv().getrawmetatable
+	end
+	if type(grm) ~= "function" then
+		return nil
+	end
+	local ok, mt = pcall(grm, game)
+	if not ok or type(mt) ~= "table" then
+		return nil
+	end
+	return rawget(mt, "__namecall"), mt
+end
+
+do
+	local nc = namecallNow()
+	local info = debug and debug.info
+	if type(nc) == "function" and type(info) == "function" then
+		local ok, src = pcall(info, nc, "s")
+		if ok and type(src) == "string" and src ~= "=[C]" and src ~= "[C]" then
+			print("[ERR] namecall gia' rotto. Chiudi il gioco, rientra, poi riesegui.")
+			return
+		end
+	end
+end
+
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
@@ -19,8 +46,10 @@ end
 local alive = true
 local scanning = false
 local logs = {}
-local logBox
+local logScroll
+local logRows = {}
 local targets = {}
+local loggedFunc = {}
 local holdConn
 local holding = false
 local gui
@@ -53,7 +82,6 @@ local setupvalue = api("setupvalue")
 local getconstants = api("getconstants")
 local getproto = api("getproto")
 local getprotos = api("getprotos")
-local setclip = api("setclipboard") or api("toclipboard") or api("setrbxclipboard")
 
 local function cut(text, n)
 	text = tostring(text or "")
@@ -65,17 +93,44 @@ end
 
 local function pushLog(line)
 	logs[#logs + 1] = line
-	if #logs > 400 then
-		table.remove(logs, 1)
-	end
 	print(line)
-	if logBox then
-		local from = math.max(1, #logs - 40)
-		local shown = {}
-		for i = from, #logs do
-			shown[#shown + 1] = logs[i]
+end
+
+local function flushLogs()
+	if not alive or not logScroll or not logScroll.Parent then
+		return
+	end
+	while #logs > 2000 do
+		table.remove(logs, 1)
+		local old = table.remove(logRows, 1)
+		if old then
+			old:Destroy()
 		end
-		logBox.Text = table.concat(shown, "\n")
+	end
+	local added = false
+	while #logRows < #logs do
+		local row = Instance.new("TextLabel")
+		row.BackgroundTransparency = 1
+		row.Size = UDim2.new(1, -10, 0, 0)
+		row.AutomaticSize = Enum.AutomaticSize.Y
+		row.Font = Enum.Font.Code
+		row.TextSize = 13
+		row.TextColor3 = Color3.fromRGB(210, 216, 200)
+		row.TextXAlignment = Enum.TextXAlignment.Left
+		row.TextYAlignment = Enum.TextYAlignment.Top
+		row.TextWrapped = true
+		row.Text = logs[#logRows + 1]
+		row.LayoutOrder = #logRows + 1
+		row.Parent = logScroll
+		logRows[#logRows + 1] = row
+		added = true
+	end
+	if added then
+		task.defer(function()
+			if logScroll then
+				logScroll.CanvasPosition = Vector2.new(0, logScroll.AbsoluteCanvasSize.Y)
+			end
+		end)
 	end
 end
 
@@ -269,7 +324,11 @@ local function scanFunction(fn, how, seen, depth)
 	local src = sourceOf(fn)
 	local interesting = hasConst(fn, "Pet Walkspeed") or string.find(src, "Game.Pets", 1, true) ~= nil
 	if interesting then
-		log(string.format("[FUNC] Trovata funzione: %s | upvalue: %d | via %s", cut(src, 140), upvalueCount(fn), how))
+		local key = src .. "|" .. tostring(upvalueCount(fn))
+		if not loggedFunc[key] then
+			loggedFunc[key] = true
+			log(string.format("[FUNC] Trovata funzione: %s | upvalue: %d | via %s", cut(src, 140), upvalueCount(fn), how))
+		end
 	end
 	for i = 1, 80 do
 		local _, val, alive = upvalueAt(fn, i)
@@ -470,8 +529,490 @@ local function applyBoost()
 	end)
 end
 
+local spyOn = false
+local spyBusy = false
+local namecallReady = false
+
+local DROP_KEYS = { "orb", "loot", "bag", "collect", "pickup", "coin" }
+local dropByName = {}
+local dropScanAt = 0
+
+local function keyHit(text)
+	if typeof(text) ~= "string" or text == "" then
+		return nil
+	end
+	local s = string.lower(text)
+	for i = 1, #DROP_KEYS do
+		if string.find(s, DROP_KEYS[i], 1, true) then
+			return DROP_KEYS[i]
+		end
+	end
+	return nil
+end
+
+local function indexDrops()
+	local now = os.clock()
+	if now - dropScanAt < 0.4 then
+		return
+	end
+	dropScanAt = now
+	local nextMap = {}
+	local things = game:GetService("Workspace"):FindFirstChild("__THINGS")
+	if not things then
+		dropByName = nextMap
+		return
+	end
+	local function take(folder, kind)
+		if not folder then
+			return
+		end
+		local kids = folder:GetChildren()
+		for i = 1, #kids do
+			local child = kids[i]
+			nextMap[child.Name] = kind
+			local ok, id = pcall(function()
+				return child:GetAttribute("ID")
+			end)
+			if ok and typeof(id) == "string" and id ~= "" then
+				nextMap[id] = kind
+			end
+		end
+	end
+	take(things:FindFirstChild("Orbs"), "Orb")
+	take(things:FindFirstChild("Lootbags"), "Lootbag")
+	dropByName = nextMap
+end
+
+local function dropKindFromInst(inst)
+	local named = dropByName[inst.Name]
+	local parent = inst.Parent
+	if parent and (parent.Name == "Orbs" or parent.Name == "Lootbags") then
+		return parent.Name == "Orbs" and "Orb" or "Lootbag"
+	end
+	local node = inst
+	for _ = 1, 6 do
+		if not node or not node.Parent then
+			break
+		end
+		if node.Parent.Name == "__THINGS" then
+			if node.Name == "Orbs" then
+				return "Orb"
+			end
+			if node.Name == "Lootbags" then
+				return "Lootbag"
+			end
+		end
+		node = node.Parent
+	end
+	return named
+end
+
+local function instPath(inst)
+	local ok, full = pcall(function()
+		return inst:GetFullName()
+	end)
+	if ok and typeof(full) == "string" then
+		return full
+	end
+	return tostring(inst.Name)
+end
+
+local function inspectDrop(value, hits, depth)
+	if depth > 3 or value == nil then
+		return
+	end
+	local kind = typeof(value)
+	if kind == "string" then
+		local key = keyHit(value)
+		if key then
+			hits.key = hits.key or key
+		end
+		local drop = dropByName[value]
+		if drop then
+			hits.drops[#hits.drops + 1] = drop .. " " .. value
+		end
+	elseif kind == "Instance" then
+		local fullName = instPath(value)
+		local key = keyHit(fullName) or keyHit(value.Name)
+		if key then
+			hits.key = hits.key or key
+		end
+		local drop = dropKindFromInst(value)
+		if drop then
+			hits.drops[#hits.drops + 1] = drop .. " " .. fullName
+		end
+	elseif kind == "table" then
+		for k, v in pairs(value) do
+			inspectDrop(k, hits, depth + 1)
+			inspectDrop(v, hits, depth + 1)
+		end
+	end
+end
+
+local function collectWanted(hits, path)
+	if #hits.drops > 0 then
+		return true
+	end
+	if hits.key and hits.key ~= "coin" then
+		return true
+	end
+	if hits.key == "coin" and keyHit(path) == "coin" then
+		return true
+	end
+	return false
+end
+
+local function dumpValue(value, depth)
+	if depth > 2 then
+		return "..."
+	end
+	local kind = typeof(value)
+	if kind == "string" then
+		local drop = dropByName[value]
+		if drop then
+			return "[HIT " .. drop .. "] " .. value
+		end
+		local id = string.match(value, "^id[%x]+$")
+			or string.match(value, "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$")
+		if id or (#value >= 24 and string.match(value, "^[%x%-]+$")) then
+			return "[ID] " .. value
+		end
+		return string.format("%q", cut(value, 80))
+	end
+	if kind == "number" or kind == "boolean" then
+		return tostring(value)
+	end
+	if kind == "Vector3" then
+		return string.format("(%.2f, %.2f, %.2f)", value.X, value.Y, value.Z)
+	end
+	if kind == "CFrame" then
+		local pos = value.Position
+		return string.format("CFrame(%.2f, %.2f, %.2f)", pos.X, pos.Y, pos.Z)
+	end
+	if kind == "Instance" then
+		local path = instPath(value)
+		local drop = dropKindFromInst(value)
+		if drop then
+			return "[HIT " .. drop .. "] " .. path
+		end
+		return path
+	end
+	if kind == "table" then
+		local parts = {}
+		local n = 0
+		for k, v in pairs(value) do
+			n = n + 1
+			if n > 8 then
+				parts[#parts + 1] = "..."
+				break
+			end
+			parts[#parts + 1] = tostring(k) .. "=" .. dumpValue(v, depth + 1)
+		end
+		return "{" .. table.concat(parts, ", ") .. "}"
+	end
+	return kind
+end
+
+local function isLuaFn(fn)
+	if typeof(fn) ~= "function" or typeof(debug) ~= "table" or typeof(debug.info) ~= "function" then
+		return false
+	end
+	local ok, src = pcall(debug.info, fn, "s")
+	return ok and typeof(src) == "string" and src ~= "=[C]" and src ~= "[C]"
+end
+
+local function recoverEngine(fn, guard)
+	if typeof(fn) ~= "function" or isLuaFn(fn) then
+		return nil
+	end
+	guard = guard or {}
+	if guard[fn] then
+		return nil
+	end
+	guard[fn] = true
+	for i = 1, 40 do
+		local name, val, aliveUp = upvalueAt(fn, i)
+		if not aliveUp then
+			break
+		end
+		if (name == "original" or name == "old") and typeof(val) == "function" and not isLuaFn(val) then
+			if upvalueCount(val) == 0 then
+				return val
+			end
+			local deeper = recoverEngine(val, guard)
+			if typeof(deeper) == "function" then
+				return deeper
+			end
+		end
+	end
+	return nil
+end
+
+local function spyBox()
+	local box = env.__DeltaNamecallSpy
+	if typeof(box) ~= "table" then
+		box = { on = false, busy = false, ready = false }
+		env.__DeltaNamecallSpy = box
+	end
+	return box
+end
+
+local function setSpy(flag)
+	spyOn = flag
+	spyBox().on = flag
+end
+
+local function ensureEngine()
+	local box = spyBox()
+	if typeof(box.engine) == "function" and (isLuaFn(box.engine) or upvalueCount(box.engine) > 0) then
+		box.engine = nil
+	end
+	if typeof(box.engine) == "function" then
+		return box.engine
+	end
+	local current, mt = namecallNow()
+	if typeof(mt) == "table" then
+		box.mt = mt
+	end
+	if typeof(current) ~= "function" or isLuaFn(current) then
+		return nil
+	end
+	local recovered = recoverEngine(current)
+	if typeof(recovered) == "function" and upvalueCount(recovered) == 0 then
+		box.engine = recovered
+		return recovered
+	end
+	if upvalueCount(current) > 0 then
+		return nil
+	end
+	if typeof(box.detour) == "function" and current == box.detour then
+		return nil
+	end
+	box.engine = current
+	return current
+end
+
+local function spyStart()
+	local box = spyBox()
+	if box.drain then
+		pcall(function()
+			box.drain:Disconnect()
+		end)
+		box.drain = nil
+	end
+	local getnamecallmethod = api("getnamecallmethod")
+	local newcclosure = api("newcclosure")
+	local setreadonly = api("setreadonly")
+	if typeof(getnamecallmethod) ~= "function" or typeof(newcclosure) ~= "function" then
+		log("[ERR] getnamecallmethod o newcclosure assente")
+		return
+	end
+	local current, mt = namecallNow()
+	if typeof(current) ~= "function" or typeof(mt) ~= "table" then
+		log("[ERR] namecall originale assente. Rientra nel gioco.")
+		return
+	end
+	if isLuaFn(current) then
+		log("[ERR] namecall gia' rotto. Chiudi il gioco, rientra, poi riesegui.")
+		return
+	end
+	box.mt = mt
+	local original = ensureEngine()
+	if typeof(original) ~= "function" then
+		log("[ERR] namecall impilato. Chiudi il gioco, rientra, poi riesegui.")
+		return
+	end
+	local token = {}
+	local probe = newcclosure(function()
+		return token
+	end)
+	if typeof(probe) ~= "function" then
+		log("[ERR] newcclosure non ha restituito una funzione")
+		return
+	end
+	local probeOk, probeGot = pcall(probe)
+	if not probeOk or probeGot ~= token then
+		log("[ERR] newcclosure perde gli upvalue, hook non installato")
+		return
+	end
+local function logFire(self, ...)
+		indexDrops()
+		local path = "?"
+		if typeof(self) == "Instance" then
+			path = instPath(self)
+		end
+		local hits = { drops = {} }
+		local pathKey = keyHit(path)
+		if pathKey then
+			hits.key = pathKey
+		end
+		local packed = { ... }
+		local n = select("#", ...)
+		for i = 1, n do
+			inspectDrop(packed[i], hits, 0)
+		end
+		if not collectWanted(hits, path) then
+			return
+		end
+		local shown = {}
+		for i = 1, n do
+			shown[i] = dumpValue(packed[i], 0)
+		end
+		local mark = ""
+		if #hits.drops > 0 then
+			mark = " HIT " .. table.concat(hits.drops, " | ")
+		end
+		log("[COLLECT] " .. path .. mark .. " | Args: " .. table.concat(shown, ", "))
+	end
+	local counts = {}
+	local detour = newcclosure(function(self, ...)
+		if box.copying then
+			return original(self, ...)
+		end
+		local method
+		if box.on and not box.busy then
+			method = getnamecallmethod()
+			if method == nil then
+				pcall(function()
+					local g = getgenv()
+					local alt = g and g.getnamecallmethod
+					if typeof(alt) == "function" then
+						method = alt()
+					end
+				end)
+			end
+			local key = tostring(method)
+			counts[key] = (counts[key] or 0) + 1
+		end
+		if (method == "FireServer" or method == "InvokeServer") and not box.busy then
+			local argc = select("#", ...)
+			local args = { ... }
+			local pack = table.pack(original(self, ...))
+			box.busy = true
+			local ok, err = pcall(logFire, self, unpack(args, 1, argc))
+			box.busy = false
+			if not ok then
+				log("[ERRORE LOG] " .. tostring(err))
+			end
+			return unpack(pack, 1, pack.n)
+		end
+		return original(self, ...)
+	end)
+	if typeof(detour) ~= "function" then
+		log("[ERR] detour assente, hook non installato")
+		return
+	end
+	if typeof(setreadonly) == "function" then
+		local unlocked = pcall(setreadonly, mt, false)
+		if not unlocked then
+			log("[ERR] metatable bloccata, hook non installato")
+			return
+		end
+	end
+	local wrote, writeErr = pcall(function()
+		mt.__namecall = detour
+	end)
+	if typeof(setreadonly) == "function" then
+		pcall(setreadonly, mt, true)
+	end
+	if not wrote then
+		log("[ERR] hook " .. tostring(writeErr))
+		return
+	end
+	if namecallNow() == original then
+		log("[ERR] namecall non sostituito")
+		return
+	end
+	box.real = original
+	box.mt = mt
+	box.detour = detour
+	box.ready = true
+	namecallReady = true
+	if box.drain then
+		pcall(function()
+			box.drain:Disconnect()
+		end)
+	end
+	box.drain = RunService.Heartbeat:Connect(function()
+		if not box.tick then
+			box.tick = os.clock()
+		end
+		if os.clock() - box.tick < 1 then
+			return
+		end
+		box.tick = os.clock()
+		local parts = {}
+		local extra = 0
+		for key, value in pairs(counts) do
+			if #parts < 8 then
+				parts[#parts + 1] = key .. "=" .. tostring(value)
+			else
+				extra = extra + value
+			end
+			counts[key] = nil
+		end
+		if #parts == 0 then
+			return
+		end
+		table.sort(parts)
+		if extra > 0 then
+			parts[#parts + 1] = "altri=" .. tostring(extra)
+		end
+		log("[HOOK] " .. table.concat(parts, " "))
+	end)
+	setSpy(true)
+	log("[REMOTE] spy attivo")
+end
+
+local function setNamecall(fn)
+	local box = spyBox()
+	if typeof(box.mt) ~= "table" or typeof(fn) ~= "function" then
+		return
+	end
+	local setreadonly = api("setreadonly")
+	if typeof(setreadonly) == "function" then
+		pcall(setreadonly, box.mt, false)
+	end
+	pcall(function()
+		rawset(box.mt, "__namecall", fn)
+	end)
+	if typeof(setreadonly) == "function" then
+		pcall(setreadonly, box.mt, true)
+	end
+	return namecallNow() == fn
+end
+
+local function spyStop()
+	if not spyOn and not spyBox().on then
+		return
+	end
+	setSpy(false)
+	log("[REMOTE] spy spento")
+end
+
+local function scanRemotes()
+	local rs = game:GetService("ReplicatedStorage")
+	local list = rs:GetDescendants()
+	local total, shown = 0, 0
+	for i = 1, #list do
+		local inst = list[i]
+		if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") or inst:IsA("UnreliableRemoteEvent") then
+			total = total + 1
+			local path = inst:GetFullName()
+			if inst.Parent == rs and string.match(inst.Name, "^%x+$") and #inst.Name >= 16 then
+				shown = shown + 1
+			end
+		end
+		if i % 400 == 0 then
+			task.wait()
+		end
+	end
+	log(string.format("[REMOTE] scan remoti=%d sospetti=%d", total, shown))
+end
+
 local function shutdown()
 	alive = false
+	setSpy(false)
 	restore()
 	pcall(function()
 		gui:Destroy()
@@ -493,7 +1034,7 @@ gui.IgnoreGuiInset = true
 gui.Parent = pg
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(520, 280)
+frame.Size = UDim2.fromOffset(460, 200)
 frame.Position = UDim2.fromOffset(12, 12)
 frame.BackgroundColor3 = Color3.fromRGB(20, 24, 30)
 frame.BackgroundTransparency = 0.08
@@ -524,26 +1065,40 @@ end
 local startBtn = button("START", 8, 84, Color3.fromRGB(50, 80, 120))
 local stopBtn = button("STOP", 98, 72, Color3.fromRGB(140, 50, 50))
 local copyBtn = button("COPIA LOG", 176, 110, Color3.fromRGB(40, 120, 50))
-local boostBtn = button("APPLICA BOOST", 292, 150, Color3.fromRGB(140, 90, 20))
+local boostBtn = button("BOOST SPEED", 292, 150, Color3.fromRGB(140, 90, 20))
 
-logBox = Instance.new("TextBox")
-logBox.Size = UDim2.new(1, -16, 1, -48)
-logBox.Position = UDim2.fromOffset(8, 42)
-logBox.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
-logBox.TextColor3 = Color3.fromRGB(210, 216, 200)
-logBox.TextSize = 13
-logBox.Font = Enum.Font.Code
-logBox.Text = "START cerca la funzione. APPLICA BOOST scrive 10000."
-logBox.TextXAlignment = Enum.TextXAlignment.Left
-logBox.TextYAlignment = Enum.TextYAlignment.Top
-logBox.TextWrapped = true
-logBox.ClearTextOnFocus = false
-logBox.TextEditable = false
-logBox.MultiLine = true
-logBox.Parent = frame
+logScroll = Instance.new("ScrollingFrame")
+logScroll.Size = UDim2.new(1, -16, 1, -48)
+logScroll.Position = UDim2.fromOffset(8, 40)
+logScroll.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
+logScroll.BorderSizePixel = 0
+logScroll.ScrollBarThickness = 8
+logScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+logScroll.CanvasSize = UDim2.new()
+logScroll.Parent = frame
+local logLayout = Instance.new("UIListLayout")
+logLayout.SortOrder = Enum.SortOrder.LayoutOrder
+logLayout.Padding = UDim.new(0, 2)
+logLayout.Parent = logScroll
+local logPad = Instance.new("UIPadding")
+logPad.PaddingTop = UDim.new(0, 4)
+logPad.PaddingLeft = UDim.new(0, 4)
+logPad.PaddingRight = UDim.new(0, 4)
+logPad.Parent = logScroll
+RunService.Heartbeat:Connect(flushLogs)
 
 startBtn.MouseButton1Click:Connect(function()
-	if not alive or scanning then
+	if not alive then
+		return
+	end
+	task.spawn(spyStart)
+	task.spawn(function()
+		local ok, err = pcall(scanRemotes)
+		if not ok and alive then
+			log("[ERR] " .. tostring(err))
+		end
+	end)
+	if scanning then
 		return
 	end
 	scanning = true
@@ -561,6 +1116,7 @@ stopBtn.MouseButton1Click:Connect(function()
 		return
 	end
 	local had = #targets
+	spyStop()
 	restore()
 	if had > 0 then
 		log("[STOP] Pet Walkspeed ripristinato")
@@ -570,20 +1126,90 @@ stopBtn.MouseButton1Click:Connect(function()
 end)
 
 copyBtn.MouseButton1Click:Connect(function()
+	local box = spyBox()
+	if box.copying then
+		return
+	end
+	setSpy(false)
 	local text = table.concat(logs, "\n")
+	local rows = #logs
 	if text == "" then
 		log("[COPY] log vuoto")
 		return
 	end
-	if typeof(setclip) ~= "function" then
-		log("[ERR] setclipboard assente")
+	local engine = ensureEngine()
+	if typeof(engine) ~= "function" then
+		log("[ERR] namecall impilato. Chiudi il gioco, rientra, poi COPIA LOG.")
 		return
 	end
-	local ok, err = pcall(setclip, text)
-	if ok then
-		log("[COPY] " .. tostring(#logs) .. " righe")
+	if not setNamecall(engine) then
+		log("[ERR] namecall non staccato")
+		return
+	end
+	box.copying = true
+	box.detour = nil
+	if typeof(box.clipBox) == "Instance" then
+		box.clipBox:Destroy()
+		box.clipBox = nil
+	end
+	local g = env
+	if typeof(getgenv) == "function" then
+		g = getgenv()
+	end
+	local holder = Instance.new("TextBox")
+	holder.Name = "DeltaLogCopy"
+	holder.ClearTextOnFocus = false
+	holder.TextEditable = true
+	holder.MultiLine = true
+	holder.Size = UDim2.fromOffset(360, 140)
+	holder.Position = UDim2.fromOffset(12, 220)
+	holder.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
+	holder.TextColor3 = Color3.fromRGB(210, 216, 200)
+	holder.TextSize = 12
+	holder.Font = Enum.Font.Code
+	holder.TextXAlignment = Enum.TextXAlignment.Left
+	holder.TextYAlignment = Enum.TextYAlignment.Top
+	holder.ZIndex = 20
+	holder.Parent = gui
+	holder.Text = text
+	box.clipBox = holder
+	local held = #holder.Text
+	if holder.Text ~= text then
+		holder:Destroy()
+		box.clipBox = nil
+		box.copying = false
+		local writeFn = g.writefile
+		local readFn = g.readfile
+		local fileOk = false
+		if typeof(writeFn) == "function" and typeof(readFn) == "function" then
+			local wrote = pcall(writeFn, "psx_delta_log.txt", text)
+			if wrote then
+				local okBack, back = pcall(readFn, "psx_delta_log.txt")
+				fileOk = okBack and back == text
+			end
+		end
+		if fileOk then
+			log("[ERR] log di " .. tostring(#text) .. " caratteri, la casella ne tiene " .. tostring(held) .. ". Testo in psx_delta_log.txt")
+		else
+			log("[ERR] log di " .. tostring(#text) .. " caratteri, la casella ne tiene " .. tostring(held))
+		end
+		return
+	end
+	task.wait()
+	holder:CaptureFocus()
+	task.wait()
+	holder.CursorPosition = #holder.Text + 1
+	holder.SelectionStart = 1
+	box.copying = false
+	local selected = holder:IsFocused() and holder.SelectionStart == 1 and holder.Text == text
+	if selected then
+		log("[COPY] " .. tostring(rows) .. " righe selezionate. Premi Ctrl+C, poi incolla.")
 	else
-		log("[ERR] setclipboard " .. tostring(err))
+		log("[ERR] selezione non riuscita")
+	end
+	local clipFn = g.setclipboard or g.toclipboard
+	if typeof(clipFn) == "function" then
+		clipFn(text)
 	end
 end)
 
@@ -603,4 +1229,7 @@ env.__DeltaPetSpeed = {
 	stop = shutdown,
 }
 
+if typeof(spyBox().detour) == "function" and typeof(ensureEngine()) ~= "function" then
+	log("[ERR] namecall impilato. Chiudi il gioco, rientra, poi riesegui.")
+end
 log("[READY] Delta pet speed")
