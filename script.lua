@@ -602,15 +602,26 @@ local function ensureEngine()
 	return current
 end
 
+local function isToggleLikeArg(value)
+	if typeof(value) == "boolean" then
+		return true
+	end
+	-- dupe.lua invia anche 0 (number) insieme a true/false
+	if typeof(value) == "number" and (value == 0 or value == 1) then
+		return true
+	end
+	return false
+end
+
 local function noteBoolArg(self, method, argc, args)
 	if typeof(self) ~= "Instance" then
-		return
+		return false
 	end
 	if not self:IsA("RemoteEvent") and not self:IsA("RemoteFunction") and not self:IsA("UnreliableRemoteEvent") then
-		return
+		return false
 	end
-	if argc < 1 or typeof(args[1]) ~= "boolean" then
-		return
+	if argc < 1 or not isToggleLikeArg(args[1]) then
+		return false
 	end
 	local path = instPath(self)
 	local row = boolArgRemotes[path]
@@ -621,35 +632,56 @@ local function noteBoolArg(self, method, argc, args)
 			method = method,
 			trueN = 0,
 			falseN = 0,
+			zeroN = 0,
+			oneN = 0,
 			last = args[1],
 		}
 		boolArgRemotes[path] = row
 	end
 	row.method = method
 	row.last = args[1]
-	if args[1] then
-		row.trueN = row.trueN + 1
-	else
-		row.falseN = row.falseN + 1
+	local v = args[1]
+	if typeof(v) == "boolean" then
+		if v then
+			row.trueN = row.trueN + 1
+		else
+			row.falseN = row.falseN + 1
+		end
+	elseif v == 0 then
+		row.zeroN = (row.zeroN or 0) + 1
+	elseif v == 1 then
+		row.oneN = (row.oneN or 0) + 1
 	end
+	return true
 end
 
-local function logNet(self, method, argc, args)
-	noteBoolArg(self, method, argc, args)
-	local path = instPath(self)
-	if not argsWanted(path, argc, args) then
-		return
-	end
+local function dumpArgs(argc, args)
 	local shown = {}
 	for i = 1, argc do
 		shown[i] = dumpValue(args[i], 0)
 	end
-	log(string.format(
-		"[NET] %s | Metodo: %s | Args: %s",
-		path,
-		method,
-		table.concat(shown, ", ")
-	))
+	return table.concat(shown, ", ")
+end
+
+local function logNet(self, method, argc, args)
+	local path = instPath(self)
+	local isBool = noteBoolArg(self, method, argc, args)
+	if isBool then
+		log(string.format(
+			"[NET_BOOL] %s | Metodo: %s | Args: %s",
+			path,
+			method,
+			dumpArgs(argc, args)
+		))
+	end
+	if argsWanted(path, argc, args) then
+		log(string.format(
+			"[NET] %s | Metodo: %s | Args: %s",
+			path,
+			method,
+			dumpArgs(argc, args)
+		))
+	end
 end
 
 local function connFunction(conn)
@@ -862,8 +894,15 @@ local function runVulnScan()
 			boolPaths[#boolPaths + 1] = path
 			addCandidate(
 				path,
-				"boolean first-arg last=" .. tostring(row.last),
-				"Argomento/" .. tostring(row.method) .. " t=" .. tostring(row.trueN) .. " f=" .. tostring(row.falseN),
+				"toggle-like first-arg last=" .. tostring(row.last),
+				string.format(
+					"Argomento/%s t=%d f=%d zero=%d one=%d",
+					tostring(row.method),
+					row.trueN or 0,
+					row.falseN or 0,
+					row.zeroN or 0,
+					row.oneN or 0
+				),
 				row.remote
 			)
 		end
@@ -887,6 +926,9 @@ local function runVulnScan()
 			#names,
 			#names > 0 and table.concat(names, " | ") or "(nessuno)"
 		))
+		if #boolPaths == 0 then
+			log("[SCAN] Nessun bool dall'hook. Esegui dupe.lua con START attivo, poi ripremi SCAN VULNS.")
+		end
 		log("[SCAN] fine. Nessun remote e' stato invocato.")
 	end)
 	scanningVulns = false
@@ -1063,7 +1105,7 @@ local function startAnalysis()
 		running = false
 		return
 	end
-	log("[START] spy attivo. Attendi Toggle Auto Hatch / Auto Delete.")
+	log("[START] spy attivo. Esegui dupe.lua, poi premi SCAN VULNS.")
 end
 
 local function copyLogs()
