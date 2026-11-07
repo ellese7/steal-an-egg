@@ -1,15 +1,15 @@
--- DELTA NETWORK SNIFFER: CACCIA AL REMOTE DI SALVATAGGIO
+-- DELTA SMART NETWORK SNIFFER (ANTI-SPAM)
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
 
 -- GUI
 local pg = LocalPlayer:WaitForChild("PlayerGui")
-local old = pg:FindFirstChild("NetworkSniffer")
+local old = pg:FindFirstChild("SmartSniffer")
 if old then old:Destroy() end
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "NetworkSniffer"
+gui.Name = "SmartSniffer"
 gui.ResetOnSpawn = false
 gui.Parent = pg
 
@@ -23,20 +23,11 @@ frame.Draggable = true
 frame.Parent = gui
 Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
 
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, 0, 0, 30)
-title.BackgroundTransparency = 1
-title.Text = "Delta Network Sniffer (Cattura Salvataggi)"
-title.TextColor3 = Color3.fromRGB(255, 255, 255)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 15
-title.Parent = frame
-
 local btnHook = Instance.new("TextButton")
 btnHook.Size = UDim2.new(1, -20, 0, 35)
 btnHook.Position = UDim2.fromOffset(10, 35)
 btnHook.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-btnHook.Text = "1. AVVIA INTERCETTAZIONE (SNIFFER)"
+btnHook.Text = "1. AVVIA SNIFFER INTELLIGENTE"
 btnHook.TextColor3 = Color3.new(1,1,1)
 btnHook.Font = Enum.Font.GothamBold
 btnHook.Parent = frame
@@ -73,27 +64,33 @@ local isHooked = false
 btnHook.MouseButton1Click:Connect(function()
     if isHooked then return end
     isHooked = true
-    btnHook.Text = "SNIFFER ATTIVO! Fai azioni nel gioco..."
+    btnHook.Text = "SNIFFER ATTIVO (Ignoro il Ping)"
     btnHook.BackgroundColor3 = Color3.fromRGB(50, 150, 50)
     
-    addLog("[SNIFFER] In ascolto di FireServer...", Color3.fromRGB(100, 200, 255))
-    addLog("[ISTRUZIONI] Vai nello shop e compra un uovo, oppure apri la banca e deposita qualcosa.", Color3.fromRGB(255, 200, 100))
+    addLog("[SNIFFER] In ascolto. Ignoro il ping 'miseg03'.", Color3.fromRGB(100, 200, 255))
+    addLog("[ISTRUZIONI] Ora compra un uovo o fai un'azione che salva.", Color3.fromRGB(255, 200, 100))
     
     local oldNamecall
     oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
         local method = getnamecallmethod()
         
         if method == "FireServer" or method == "InvokeServer" then
-            -- Verifichiamo se è un RemoteEvent con nome hash (32 caratteri)
             if self:IsA("RemoteEvent") or self:IsA("RemoteFunction") then
                 if string.match(self.Name, "^%x+$") and #self.Name >= 32 then
                     
-                    -- Dump degli argomenti
+                    -- FILTRO ANTI-SPAM: Ignora il remote del ping
+                    if self.Name == "645cdb478042458ba422781d7bdd738b" then
+                        return oldNamecall(self, ...)
+                    end
+
                     local args = {...}
                     local argString = ""
+                    local hasTable = false
+                    
                     for i, v in ipairs(args) do
                         if type(v) == "table" then
                             argString = argString .. "{Tabella}, "
+                            hasTable = true
                         elseif typeof(v) == "Instance" then
                             argString = argString .. v.Name .. ", "
                         else
@@ -101,9 +98,9 @@ btnHook.MouseButton1Click:Connect(function()
                         end
                     end
                     
-                    -- Logghiamo solo i remote che ricevono argomenti (scarta i ping vuoti)
-                    if #args > 0 then
-                        addLog("  [FIRED] " .. self.Name, Color3.fromRGB(255, 150, 150))
+                    -- LOGGA SOLO SE: C'è una tabella O se non è solo il nome utente
+                    if hasTable or (#args > 0 and tostring(args[1]) ~= "miseg03") then
+                        addLog("  [DIVERSO DAL PING] " .. self.Name, Color3.fromRGB(255, 150, 150))
                         addLog("      Args: " .. argString, Color3.fromRGB(200, 255, 200))
                     end
                 end
