@@ -12,10 +12,17 @@ end
 local COMMANDS = { "Toggle Setting", "Update Hoverboard State" }
 local PAYLOADS = { "0", "{}" }
 local CHECKS = 3
-local BASE_STEP = 6
-local WATCH_SECONDS = 150
+local SAMPLE_STEP = 1
+local WATCH_SECONDS = 6
+local HOLD_STEP = 4
 local MAX_LINES = 500
 local NAME_HINTS = { "time", "tick", "save", "sync", "version" }
+local EXACT_KEYS = {
+	LastSaveTimestamp = true,
+	SaveTimestamp = true,
+	SaveTime = true,
+	_saveClock = true,
+}
 
 local root = _G
 pcall(function()
@@ -39,6 +46,8 @@ local bucket = {
 	foreign = 0,
 	expect = nil,
 	remote = nil,
+	loose = false,
+	capture = nil,
 	useCaller = false,
 	old = nil,
 }
@@ -583,10 +592,12 @@ local function collectClocks()
 			local path = appendPath(prefix, key)
 			if path and realNumber(value) then
 				local named = nameHint(key)
-				if named or (looksLikeStamp(value) and depth <= 3) then
+				local exact = type(key) == "string" and EXACT_KEYS[key] == true
+				if exact or named or (looksLikeStamp(value) and depth <= 3) then
 					found[#found + 1] = {
 						path = path,
 						named = named,
+						exact = exact,
 						value = value,
 					}
 				elseif looksLikeStamp(value) then
@@ -629,46 +640,29 @@ local function readGroup(list)
 	return out
 end
 
-local function mean(list)
-	local sum = 0
-	for _, value in ipairs(list) do
-		sum += value
-	end
-	return sum / #list
-end
-
 local function observeClocks(list)
-	local prev = readGroup(list)
-	if not prev then
+	local first = readGroup(list)
+	if not first then
 		return nil, running and "errore" or "stop"
 	end
-	local lastChange = {}
-	local gaps = {}
+	local changes = {}
+	local prev = first
 	local deadline = os.clock() + WATCH_SECONDS
 	while running and os.clock() < deadline do
 		local left = math.max(0, math.ceil(deadline - os.clock()))
 		setStatus("Misuro " .. tostring(left) .. "s")
-		if not waitSeconds(BASE_STEP) then
+		if not waitSeconds(SAMPLE_STEP) then
 			return nil, "stop"
 		end
 		local now = readGroup(list)
 		if not now then
 			return nil, running and "errore" or "stop"
 		end
-		local stamp = os.clock()
 		for _, item in ipairs(list) do
 			local before = prev[item.path]
 			local value = now[item.path]
 			if realNumber(before) and realNumber(value) and before ~= value then
-				if lastChange[item.path] then
-					local bag = gaps[item.path]
-					if not bag then
-						bag = {}
-						gaps[item.path] = bag
-					end
-					bag[#bag + 1] = stamp - lastChange[item.path]
-				end
-				lastChange[item.path] = stamp
+				changes[item.path] = (changes[item.path] or 0) + 1
 			end
 		end
 		prev = now
@@ -676,35 +670,34 @@ local function observeClocks(list)
 	if not running then
 		return nil, "stop"
 	end
-	return gaps, nil
+	return {
+		first = first,
+		last = prev,
+		changes = changes,
+	}, nil
 end
 
-local function pickClock(list, gaps)
-	local best = nil
-	local bestRank = -math.huge
-	for _, item in ipairs(list) do
-		local bag = gaps[item.path]
-		if bag and #bag >= 1 then
-			local period = mean(bag)
-			local named = item.named and 1 or 0
-			local band = (period >= 25 and period <= 75) and 1 or 0
-			local rank = band * 1000000 + named * 100000
-			if band == 1 then
-				rank += 1000 - math.abs(period - 45)
-			else
-				rank += math.min(period, 500)
-			end
-			if rank > bestRank then
-				bestRank = rank
-				best = {
-					path = item.path,
-					period = period,
-					named = item.named,
-				}
+local function pickClock(list)
+	local order = { "LastSaveTimestamp", "SaveTimestamp", "SaveTime", "_saveClock" }
+	for _, name in ipairs(order) do
+		for _, item in ipairs(list) do
+			if item.exact then
+				local leaf = nil
+				walkPath(item.path, function(key)
+					leaf = tostring(key)
+				end)
+				if leaf == name then
+					return item
+				end
 			end
 		end
 	end
-	return best
+	for _, item in ipairs(list) do
+		if item.exact then
+			return item
+		end
+	end
+	return nil
 end
 
 local function considerMap(tbl, maps, depth)
@@ -827,7 +820,37 @@ local function remotesFromMaps(maps)
 			log(string.format("[REMOTE] %s isolato da upvalue id %s", command, debugId(list[1])))
 		elseif #list > 1 then
 			blocked[command] = true
-			log("[REMOTE] " .. command .. " ambiguo, payload non inviato")
+			log("[REMOTE] " .. command .. " ambiguo negli upvalue, payload non inviato")
+		else
+			local keySeen = false
+			local hashCount = 0
+			for _, map in ipairs(maps.commandMaps) do
+				local hash = nil
+				pcall(function()
+					hash = map[command]
+				end)
+				if hash ~= nil then
+					keySeen = true
+					if isHash(hash) then
+						hashCount += 1
+					end
+				end
+			end
+			local reason = "chiave assente nella cache: il comando non e stato usato in questa sessione"
+			if #maps.commandMaps == 0 then
+				reason = "nessuna mappa comando negli upvalue di Fire"
+			elseif keySeen and hashCount == 0 then
+				reason = "chiave presente ma il valore non e un hash"
+			elseif hashCount > 0 then
+				reason = "hash trovato ma nessuna istanza RemoteEvent"
+			end
+			log(string.format(
+				"[REMOTE] %s upvalue: %s | mappe comando %d | mappe remote %d",
+				command,
+				reason,
+				#maps.commandMaps,
+				#maps.remoteMaps
+			))
 		end
 	end
 	return found, blocked
@@ -914,9 +937,10 @@ local function remotesFromGc(found, blocked)
 				log(string.format("[REMOTE] %s isolato da getgc id %s", command, debugId(list[1])))
 			elseif #list > 1 then
 				blocked[command] = true
-				log("[REMOTE] " .. command .. " ambiguo, payload non inviato")
+				log("[REMOTE] " .. command .. " ambiguo in getgc, payload non inviato")
 			else
-				log("[REMOTE] " .. command .. " non isolato, payload non inviato")
+				local hashCount = hashes and #hashes or 0
+				log(string.format("[REMOTE] %s getgc: chiave assente o senza istanza | hash trovati %d", command, hashCount))
 			end
 		end
 	end
@@ -930,7 +954,7 @@ local function findRemotes(library)
 		found, blocked = remotesFromMaps(maps)
 	end
 	remotesFromGc(found, blocked)
-	return found
+	return found, blocked
 end
 
 local function ours()
@@ -961,14 +985,25 @@ local function namecall(self, ...)
 		method = getnamecallmethod()
 	end
 	local state = root.__DeltaTypeCheck
-	if state and state.armed and method == "FireServer" and state.remote and self == state.remote and argsMatch(state.expect, ...) then
-		pcall(function()
-			if not ours() then
-				state.foreign = (state.foreign or 0) + 1
-				return
-			end
-			state.hits = (state.hits or 0) + 1
-		end)
+	if state and state.armed and method == "FireServer" and argsMatch(state.expect, ...) then
+		local owned = false
+		if state.remote then
+			owned = self == state.remote
+		elseif state.loose then
+			owned = true
+		end
+		if owned then
+			pcall(function()
+				if state.remote and not ours() then
+					state.foreign = (state.foreign or 0) + 1
+					return
+				end
+				state.hits = (state.hits or 0) + 1
+				if state.loose and state.capture == nil then
+					state.capture = self
+				end
+			end)
+		end
 	end
 	local fwd = state and state.old
 	if fwd then
@@ -1123,6 +1158,29 @@ local function payloadValue(label)
 	return {}
 end
 
+local function sendLoose(library, command, value)
+	bucket.hits = 0
+	bucket.foreign = 0
+	bucket.expect = value
+	bucket.remote = nil
+	bucket.capture = nil
+	bucket.loose = true
+	bucket.armed = true
+	local callOk, callErr = pcall(function()
+		library.Network.Fire(command, value)
+	end)
+	local deadline = os.clock() + 1
+	while running and bucket.hits == 0 and os.clock() < deadline do
+		task.wait(0.05)
+	end
+	bucket.armed = false
+	bucket.loose = false
+	bucket.expect = nil
+	local capture = bucket.capture
+	bucket.capture = nil
+	return bucket.hits, capture, callOk, callErr
+end
+
 local function run()
 	bucket.useCaller = false
 	if type(checkcaller) == "function" then
@@ -1166,9 +1224,6 @@ local function run()
 		return
 	end
 	log(string.format("[SAVE] %s | candidati %d", saveSource, #clocks))
-	for _, item in ipairs(clocks) do
-		log(string.format("[CLOCK] Trovato possibile timestamp: %s = %s", showPath(item.path), tostring(item.value)))
-	end
 	if hidden > 0 then
 		log("[CLOCK] Timestamp anonimi oltre il livello 3 non elencati: " .. tostring(hidden))
 	end
@@ -1177,39 +1232,56 @@ local function run()
 		setStatus("Nessun clock", Color3.fromRGB(255, 200, 120))
 		return
 	end
-	log("[CLOCK] Misuro il periodo per 150s. Servono due scatti sullo stesso campo")
-	local gaps, why = observeClocks(clocks)
+	log("[CLOCK] Confronto di 6 secondi, un campione ogni secondo")
+	local report, why = observeClocks(clocks)
 	if not running or why == "stop" then
 		return
 	end
-	if why == "errore" or not gaps then
+	if why == "errore" or type(report) ~= "table" then
 		log("[INFO] Lettura del clock interrotta. Test annullato")
 		setStatus("Clock illeggibile", Color3.fromRGB(255, 160, 120))
 		return
 	end
-	local chosen = pickClock(clocks, gaps)
+	for _, item in ipairs(clocks) do
+		local startValue = report.first[item.path]
+		local endValue = report.last[item.path]
+		local ticks = report.changes[item.path] or 0
+		local note = "fermo in questi 6s"
+		if item.exact then
+			note = "chiave esatta del save"
+		elseif ticks > 0 then
+			note = "si muove, non e il timestamp di salvataggio"
+		elseif looksLikeStamp(item.value) and type(nowTime) == "number" and realNumber(startValue) then
+			note = string.format("unix fermo, scarto da os.time %d", math.floor(startValue - nowTime))
+		end
+		log(string.format(
+			"[CLOCK] %s | %s -> %s | scatti %d | %s",
+			showPath(item.path),
+			tostring(startValue),
+			tostring(endValue),
+			ticks,
+			note
+		))
+	end
+	local chosen = pickClock(clocks)
 	if not chosen then
-		log("[INFO] Nessun candidato e scattato due volte. Senza periodo non c'e la prova. Test annullato")
-		setStatus("Periodo ignoto", Color3.fromRGB(255, 200, 120))
+		log("[INFO] LastSaveTimestamp non e nel save. Gli altri campi non sono il clock di salvataggio. Test annullato")
+		setStatus("Clock assente", Color3.fromRGB(255, 200, 120))
 		return
 	end
-	local step = BASE_STEP
-	if chosen.period > BASE_STEP then
-		step = math.ceil(chosen.period) + BASE_STEP
-	end
-	local fresh = readSaved(chosen.path)
+	local baselineTicks = report.changes[chosen.path] or 0
+	local alreadyStill = baselineTicks < 1
 	log(string.format(
-		"[CLOCK] Scelto: %s | periodo %.0fs | valore %s",
+		"[CLOCK] Scelto: %s | valore %s | scatti prima del payload %d",
 		showPath(chosen.path),
-		chosen.period,
-		tostring(fresh)
+		tostring(report.last[chosen.path]),
+		baselineTicks
 	))
-	log(string.format(
-		"[CLOCK] Controllo ogni %ds. Tre valori identici di fila = tre cicli saltati",
-		step
-	))
+	if alreadyStill then
+		log("[CLOCK] Non si e mosso nei 6 secondi prima del payload. Era gia fermo.")
+	end
 	setStatus("Cerco i remote")
-	local remotes = findRemotes(library)
+	local remotes, blocked = findRemotes(library)
 	if not running then
 		return
 	end
@@ -1219,8 +1291,7 @@ local function run()
 	end
 	local confirmed = 0
 	for _, command in ipairs(COMMANDS) do
-		local remote = remotes[command]
-		if not remote then
+		if blocked[command] then
 			continue
 		end
 		for _, label in ipairs(PAYLOADS) do
@@ -1228,22 +1299,39 @@ local function run()
 				return
 			end
 			setStatus(command .. " " .. label)
-			local hits, foreign, callOk, callErr = sendPayload(remote, payloadValue(label))
+			local value = payloadValue(label)
+			local remote = remotes[command]
+			local hits = 0
+			local foreign = 0
+			local callOk = true
+			local callErr = nil
+			if remote then
+				hits, foreign, callOk, callErr = sendPayload(remote, value)
+			else
+				local capture
+				hits, capture, callOk, callErr = sendLoose(library, command, value)
+				foreign = 0
+				if hits > 0 and typeof(capture) == "Instance" then
+					remotes[command] = capture
+					log(string.format("[REMOTE] %s visto durante Network.Fire id %s", command, debugId(capture)))
+				end
+			end
 			if not callOk then
 				log("[NET] invio fallito: " .. tostring(callErr))
 			end
 			if hits == 1 and foreign == 0 then
 				confirmed += 1
-				log(string.format("[NET] %s | Payload: %s | confermato", command, label))
+				local how = remote and "FireServer" or "Network.Fire"
+				log(string.format("[NET] %s | Payload: %s | confermato via %s", command, label, how))
 			else
-				local detail = (hits == 0 and foreign == 0) and "non uscito" or "non isolato"
+				local detail = (hits == 0 and foreign == 0) and "nessun FireServer" or "non isolato"
 				log(string.format("[NET] %s | Payload: %s | %s", command, label, detail))
 			end
 		end
 	end
 	if confirmed < 1 then
-		log("[INFO] Nessun FireServer confermato. Verdetto non emesso")
-		setStatus("Pacchetto non valido", Color3.fromRGB(255, 180, 90))
+		log("[INFO] Nessun FireServer confermato. Il client ha scartato la chiamata prima dell'invio. Verdetto non emesso")
+		setStatus("Pacchetto non uscito", Color3.fromRGB(255, 180, 90))
 		return
 	end
 	local previous = readSaved(chosen.path)
@@ -1256,7 +1344,7 @@ local function run()
 	local sawMove = false
 	for index = 1, CHECKS do
 		setStatus(string.format("Check %d/%d", index, CHECKS))
-		if not waitSeconds(step) then
+		if not waitSeconds(HOLD_STEP) then
 			return
 		end
 		local now = readSaved(chosen.path)
@@ -1271,14 +1359,16 @@ local function run()
 			log(string.format("[SYNC] Check %d: avanza %s -> %s", index, tostring(previous), tostring(now)))
 			previous = now
 		end
-		if holdCount >= 3 then
+		if holdCount >= 3 and not alreadyStill then
 			log("[SAVE FROZEN] Il server ha smesso di aggiornare il timestamp di salvataggio!")
 			setStatus("SAVE FROZEN", Color3.fromRGB(255, 90, 90))
 			setStroke(Color3.fromRGB(210, 50, 50))
 			return
 		end
 	end
-	if sawMove then
+	if alreadyStill then
+		log("[SYNC] Resta fermo, ma lo era gia prima del payload. Verdetto non emesso.")
+	elseif sawMove then
 		log("[SYNC] Il timestamp si e aggiornato. Nessun blocco misurato.")
 	else
 		log("[SYNC] Non ci sono tre fermate di fila. Nessun blocco misurato.")
@@ -1449,5 +1539,5 @@ logBox.FocusLost:Connect(function()
 	logBox.Text = table.concat(lines, "\n")
 end)
 
-log("[GUI] Pronto. Cerca il timestamp, misura il periodo, poi manda 0 e {}")
+log("[GUI] Pronto. Legge LastSaveTimestamp per 6 secondi, poi manda 0 e {}")
 log("[NOTA] Tieni premuto il log per selezionarlo. COPIA LOG usa setclipboard")
