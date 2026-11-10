@@ -18,6 +18,13 @@ local bucket = root.__DeltaCrude
 if type(bucket) == "table" then
 	bucket.running = false
 	bucket.enabled = false
+	if type(bucket.clickConns) == "table" then
+		for _, conn in ipairs(bucket.clickConns) do
+			pcall(function()
+				conn:Disconnect()
+			end)
+		end
+	end
 	if bucket.old and type(hookmetamethod) == "function" then
 		pcall(hookmetamethod, game, "__namecall", bucket.old)
 	end
@@ -29,6 +36,7 @@ bucket = {
 	old = nil,
 	chestId = nil,
 	collapsed = 0,
+	clickConns = {},
 	inspected = {},
 	inspect = {},
 	queue = {},
@@ -106,7 +114,31 @@ end
 local function copyLogs()
 	flushQueue()
 	local blob = table.concat(lines, "\n")
-	local writer = setclipboard or toclipboard
+	local writer = nil
+	local spots = { _G }
+	if type(getgenv) == "function" then
+		local ok, genv = pcall(getgenv)
+		if ok and type(genv) == "table" then
+			spots[#spots + 1] = genv
+		end
+	end
+	for _, spot in ipairs(spots) do
+		for _, name in ipairs({ "setclipboard", "toclipboard", "setrbxclipboard" }) do
+			local ok, val = pcall(function()
+				return spot[name]
+			end)
+			if ok and type(val) == "function" then
+				writer = val
+				break
+			end
+		end
+		if writer then
+			break
+		end
+	end
+	if not writer and type(setclipboard) == "function" then
+		writer = setclipboard
+	end
 	local copied = false
 	if type(writer) == "function" then
 		local ok = pcall(writer, blob)
@@ -190,17 +222,14 @@ local function scanValue(value, chestId, depth, seen, found)
 		return
 	end
 	local kind = typeof(value)
-	if kind == "string" then
-		if textHits(value) then
+	if kind == "string" or kind == "number" then
+		local text = tostring(value)
+		if kind == "string" and textHits(value) then
 			found.word = true
 		end
-		if chestId and value == chestId then
+		if (chestId and text == chestId) or (bucket.chestIds and bucket.chestIds[text]) then
 			found.id = true
 		end
-		return
-	end
-	if kind == "number" and chestId and tostring(value) == chestId then
-		found.id = true
 		return
 	end
 	if kind == "Instance" then
@@ -436,15 +465,19 @@ bucket.capture = capture
 
 local function namecall(self, ...)
 	local state = root.__DeltaCrude
-	if state and state.enabled and type(getnamecallmethod) == "function" then
-		local okMethod, method = pcall(getnamecallmethod)
-		if okMethod and (method == "FireServer" or method == "InvokeServer") then
-			local callerInst = nil
-			if type(getcallingscript) == "function" then
-				callerInst = getcallingscript()
+	local method = nil
+	if type(getnamecallmethod) == "function" then
+		method = getnamecallmethod()
+	end
+	if state and state.enabled and (method == "FireServer" or method == "InvokeServer") then
+		local packed = table.pack(...)
+		local remote = self
+		task.defer(function()
+			local current = root.__DeltaCrude
+			if current and current.enabled and current.capture then
+				pcall(current.capture, method, remote, packed, nil)
 			end
-			pcall(state.capture, method, self, table.pack(...), callerInst)
-		end
+		end)
 	end
 	local fwd = state and state.old
 	if fwd then
@@ -566,10 +599,19 @@ local function findChest()
 	end
 	local origin = positionOf(LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart"))
 	local best, bestDist
+	local ids = {}
 	for _, coin in ipairs(coins:GetChildren()) do
 		local name = coin:GetAttribute("Name")
 		local area = coin:GetAttribute("Area")
 		local health = tonumber(coin:GetAttribute("Health"))
+		local id = coin:GetAttribute("ID")
+		if type(id) ~= "string" or id == "" then
+			id = coin.Name
+		end
+		id = tostring(id)
+		if name == CHEST_NAME or area == CHEST_AREA then
+			ids[id] = true
+		end
 		if (name == CHEST_NAME or area == CHEST_AREA) and (health == nil or health > 0) then
 			local pos = positionOf(coin)
 			local dist = 0
@@ -582,6 +624,19 @@ local function findChest()
 			end
 		end
 	end
+	bucket.chestIds = ids
+	local current = bucket.tracked
+	if current and current.Parent then
+		local health = tonumber(current:GetAttribute("Health"))
+		if health == nil or health > 0 then
+			local currentPos = positionOf(current)
+			local currentDist = origin and currentPos and (currentPos - origin).Magnitude
+			if not best or best == current or not currentDist or not bestDist or bestDist + 25 >= currentDist then
+				return current
+			end
+		end
+	end
+	bucket.tracked = best
 	return best
 end
 
@@ -631,6 +686,197 @@ local lastBillboard
 local lastChestId
 local lastDist = {}
 local announcedFolder = false
+local dumpedDetail = {}
+local boundClicks = {}
+
+local function fmtNum(n)
+	n = tonumber(n)
+	if not n then
+		return "?"
+	end
+	local absn = math.abs(n)
+	if absn >= 1e15 then
+		return string.format("%.2fQ", n / 1e15)
+	elseif absn >= 1e12 then
+		return string.format("%.2fT", n / 1e12)
+	elseif absn >= 1e9 then
+		return string.format("%.2fB", n / 1e9)
+	elseif absn >= 1e6 then
+		return string.format("%.2fM", n / 1e6)
+	elseif absn >= 1e3 then
+		return string.format("%.2fK", n / 1e3)
+	end
+	return tostring(n)
+end
+
+local function looksValueText(text)
+	if type(text) ~= "string" or text == "" then
+		return false
+	end
+	if string.find(text, "[%d%.]+%s*[KkMmBbTtQq]") then
+		return true
+	end
+	if string.find(text, "%d[%d,]*%.?%d*") and #text <= 24 then
+		return true
+	end
+	return false
+end
+
+local function readBillboard(inst)
+	local ok, descendants = pcall(function()
+		return inst:GetDescendants()
+	end)
+	if not ok then
+		return nil
+	end
+	local best = nil
+	for _, child in ipairs(descendants) do
+		if child:IsA("BillboardGui") or child:IsA("SurfaceGui") then
+			for _, label in ipairs(child:GetDescendants()) do
+				if label:IsA("TextLabel") or label:IsA("TextButton") then
+					local text = label.Text
+					if looksValueText(text) then
+						local lower = string.lower(label.Name)
+						if string.find(lower, "amount", 1, true)
+							or string.find(lower, "value", 1, true)
+							or string.find(lower, "health", 1, true)
+							or string.find(lower, "coin", 1, true)
+							or string.find(lower, "hp", 1, true) then
+							return text
+						end
+						best = best or text
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function dumpBreakable(coin)
+	local id = chestLabel(coin)
+	if dumpedDetail[id] then
+		return
+	end
+	dumpedDetail[id] = true
+	local pos = positionOf(coin)
+	local hpText = healthText(coin)
+	local bill = readBillboard(coin)
+	local path = coin.Name
+	pcall(function()
+		path = coin:GetFullName()
+	end)
+	queueLog(string.format(
+		"[BREAKABLE] Nome: %s | Pos: %s | Value: %s | HP: %s",
+		tostring(coin:GetAttribute("Name") or coin.Name),
+		tostring(pos),
+		tostring(bill or fmtNum(coin:GetAttribute("Health"))),
+		hpText
+	))
+	queueLog(string.format("[BREAKABLE] id=%s path=%s class=%s", id, path, coin.ClassName))
+	local bits = {}
+	local attrOk, attrs = pcall(function()
+		return coin:GetAttributes()
+	end)
+	if attrOk and type(attrs) == "table" then
+		for key, value in pairs(attrs) do
+			bits[#bits + 1] = tostring(key) .. "=" .. short(value, 60)
+		end
+		table.sort(bits)
+	end
+	queueLog("[BREAKABLE] attrs " .. (#bits > 0 and table.concat(bits, " | ") or "nessuno"))
+	local kids = {}
+	local childOk, children = pcall(function()
+		return coin:GetChildren()
+	end)
+	if childOk then
+		for _, child in ipairs(children) do
+			kids[#kids + 1] = child.ClassName .. ":" .. child.Name
+			if #kids >= 12 then
+				break
+			end
+		end
+	end
+	queueLog("[BREAKABLE] kids " .. (#kids > 0 and table.concat(kids, ", ") or "nessuno"))
+	local gui = {}
+	local descOk, descendants = pcall(function()
+		return coin:GetDescendants()
+	end)
+	local detectors = 0
+	if descOk then
+		for _, child in ipairs(descendants) do
+			if child:IsA("TextLabel") or child:IsA("TextButton") or child:IsA("TextBox") then
+				if type(child.Text) == "string" and child.Text ~= "" and #gui < 6 then
+					gui[#gui + 1] = child.Name .. "=" .. short(child.Text, 40)
+				end
+			elseif child:IsA("ClickDetector") then
+				detectors += 1
+				queueLog(string.format(
+					"[BREAKABLE] ClickDetector %s parent=%s MaxActivationDistance=%s",
+					child:GetFullName(),
+					child.Parent and child.Parent.Name or "?",
+					tostring(child.MaxActivationDistance)
+				))
+			end
+		end
+	end
+	queueLog("[BREAKABLE] gui " .. (#gui > 0 and table.concat(gui, " | ") or "nessuno"))
+	if detectors == 0 then
+		queueLog("[BREAKABLE] ClickDetector nessuno")
+	end
+end
+
+local function bindChestClicks(coin)
+	if boundClicks[coin] then
+		return
+	end
+	boundClicks[coin] = true
+	local id = chestLabel(coin)
+	local hooked = 0
+	local ok, descendants = pcall(function()
+		return coin:GetDescendants()
+	end)
+	if not ok then
+		queueLog("[CLICK] cassa " .. id .. " discendenti non letti")
+		return
+	end
+	for _, child in ipairs(descendants) do
+		if child:IsA("ClickDetector") then
+			hooked += 1
+			local conn = child.MouseClick:Connect(function(player)
+				if player ~= LocalPlayer or not bucket.running then
+					return
+				end
+				bucket.tracked = coin
+				bucket.chestId = id
+				queueLog(string.format("[CLICK] cassa %s detector=%s", id, child:GetFullName()))
+				dumpedDetail[id] = nil
+				dumpBreakable(coin)
+			end)
+			bucket.clickConns[#bucket.clickConns + 1] = conn
+		end
+	end
+	if hooked == 0 then
+		queueLog("[CLICK] cassa " .. id .. " senza ClickDetector")
+	else
+		queueLog(string.format("[CLICK] cassa %s agganciata, detector %d", id, hooked))
+	end
+end
+
+local function bindAllChests()
+	local holder = Workspace:FindFirstChild("__ITEMS")
+	local coins = holder and holder:FindFirstChild("Coins")
+	if not coins then
+		return
+	end
+	for _, coin in ipairs(coins:GetChildren()) do
+		local name = coin:GetAttribute("Name")
+		local area = coin:GetAttribute("Area")
+		if name == CHEST_NAME or area == CHEST_AREA then
+			bindChestClicks(coin)
+		end
+	end
+end
 
 local function sample()
 	local pets, source = ownedPets()
@@ -638,6 +884,7 @@ local function sample()
 		announcedFolder = true
 		queueLog("[PETS] " .. source)
 	end
+	bindAllChests()
 	local coin = findChest()
 	if not coin then
 		bucket.chestId = nil
@@ -660,6 +907,7 @@ local function sample()
 			tostring(coin:GetAttribute("Area")),
 			tostring(positionOf(coin))
 		))
+		dumpBreakable(coin)
 	end
 	local hpText, hp = healthText(coin)
 	local chestPos = positionOf(coin)
@@ -690,7 +938,13 @@ local function sample()
 		end
 	end
 	if hp and lastHealth and hp < lastHealth then
-		queueLog(string.format("[HP] cassa %s %s -> %s", id, string.format("%.0f", lastHealth), hpText))
+		queueLog(string.format(
+			"[HP] cassa %s %s -> %s | billboard %s",
+			id,
+			fmtNum(lastHealth),
+			fmtNum(hp),
+			tostring(readBillboard(coin) or "-")
+		))
 		if nearest and nearestDist and nearestDist <= HIT_DIST then
 			queueLog(string.format(
 				"[PET] %s ha colpito la cassa! dist %.1f pos %s",
@@ -740,6 +994,9 @@ local function startMonitor()
 	bucket.seenNet = {}
 	bucket.collapsed = 0
 	bucket.chestId = nil
+	bucket.tracked = nil
+	bucket.chestIds = {}
+	dumpedDetail = {}
 	lastHealth = nil
 	lastBillboard = nil
 	lastChestId = nil
