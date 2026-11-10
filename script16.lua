@@ -40,37 +40,17 @@ local statusLabel
 local startBtn
 local stopBtn
 local logScroll
+local logBox
 local lines = {}
-local painted = false
 
 local function paintLogs()
-	if not logScroll then
+	if not logBox then
 		return
 	end
-	for _, child in ipairs(logScroll:GetChildren()) do
-		if child:IsA("TextLabel") then
-			child:Destroy()
-		end
+	if logBox:IsFocused() then
+		return
 	end
-	local widest = 0
-	for index, line in ipairs(lines) do
-		local row = Instance.new("TextLabel")
-		row.BackgroundTransparency = 1
-		row.Size = UDim2.fromOffset(2200, 18)
-		row.Font = Enum.Font.Code
-		row.TextSize = 13
-		row.TextXAlignment = Enum.TextXAlignment.Left
-		row.TextColor3 = Color3.fromRGB(210, 220, 200)
-		row.Text = line
-		row.Parent = logScroll
-		if #line > widest then
-			widest = #line
-		end
-	end
-	logScroll.CanvasSize = UDim2.fromOffset(math.max(widest * 8, 400), #lines * 20 + 8)
-	if not painted then
-		logScroll.CanvasPosition = Vector2.new(0, #lines * 20)
-	end
+	logBox.Text = table.concat(lines, "\n")
 end
 
 local function pushLine(text)
@@ -78,7 +58,6 @@ local function pushLine(text)
 	while #lines > MAX_LINES do
 		table.remove(lines, 1)
 	end
-	painted = false
 end
 
 local function queueLog(text)
@@ -95,13 +74,11 @@ local function flushQueue()
 		pushLine(text)
 	end
 	paintLogs()
-	painted = true
 end
 
 local function logNow(text)
 	pushLine(text)
 	paintLogs()
-	painted = true
 end
 
 local function setStatus(text)
@@ -110,22 +87,34 @@ local function setStatus(text)
 	end
 end
 
+local function selectLogs()
+	flushQueue()
+	if logBox then
+		logBox.Text = table.concat(lines, "\n")
+		logBox:CaptureFocus()
+		task.defer(function()
+			if not logBox then
+				return
+			end
+			logBox.SelectionStart = 1
+			logBox.CursorPosition = #logBox.Text + 1
+		end)
+	end
+	setStatus("Tieni premuto e scegli Copia")
+end
+
 local function copyLogs()
 	flushQueue()
 	local blob = table.concat(lines, "\n")
 	local writer = setclipboard or toclipboard
-	if type(writer) ~= "function" then
-		logNow("[ERRORE] setclipboard non esiste su questo executor")
-		setStatus("Copia non disponibile")
-		return
+	local copied = false
+	if type(writer) == "function" then
+		local ok = pcall(writer, blob)
+		copied = ok
 	end
-	local ok, err = pcall(writer, blob)
-	if ok then
-		setStatus("Log copiati")
-		logNow("[GUI] Log copiati (" .. tostring(#lines) .. " righe)")
-	else
-		logNow("[ERRORE] setclipboard: " .. tostring(err))
-		setStatus("Copia fallita")
+	selectLogs()
+	if copied then
+		setStatus("Copiato, oppure tieni premuto il testo")
 	end
 end
 
@@ -870,13 +859,45 @@ logScroll.Size = UDim2.new(1, -16, 1, -64)
 logScroll.BackgroundColor3 = Color3.fromRGB(10, 12, 16)
 logScroll.BorderSizePixel = 0
 logScroll.ScrollBarThickness = 8
-logScroll.ScrollingDirection = Enum.ScrollingDirection.XY
+logScroll.ScrollingDirection = Enum.ScrollingDirection.Y
+logScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 logScroll.CanvasSize = UDim2.fromOffset(0, 0)
 logScroll.Parent = frame
 
 local scrollCorner = Instance.new("UICorner")
 scrollCorner.CornerRadius = UDim.new(0, 8)
 scrollCorner.Parent = logScroll
+
+logBox = Instance.new("TextBox")
+logBox.Name = "LogText"
+logBox.BackgroundTransparency = 1
+logBox.Size = UDim2.new(1, -12, 0, 0)
+logBox.Position = UDim2.fromOffset(6, 4)
+logBox.AutomaticSize = Enum.AutomaticSize.Y
+logBox.ClearTextOnFocus = false
+logBox.MultiLine = true
+logBox.TextEditable = true
+logBox.TextWrapped = true
+logBox.Font = Enum.Font.Code
+logBox.TextSize = 14
+logBox.TextXAlignment = Enum.TextXAlignment.Left
+logBox.TextYAlignment = Enum.TextYAlignment.Top
+logBox.TextColor3 = Color3.fromRGB(210, 220, 200)
+logBox.Text = ""
+logBox.Parent = logScroll
+
+local function fitLogBox()
+	local width = math.max(logScroll.AbsoluteSize.X - 16, 80)
+	logBox.Size = UDim2.fromOffset(width, 0)
+end
+
+logScroll:GetPropertyChangedSignal("AbsoluteSize"):Connect(fitLogBox)
+fitLogBox()
+task.defer(fitLogBox)
+
+logBox.FocusLost:Connect(function()
+	logBox.Text = table.concat(lines, "\n")
+end)
 
 startBtn.MouseButton1Click:Connect(function()
 	task.spawn(startMonitor)
@@ -888,4 +909,4 @@ gui.Destroying:Connect(function()
 	pcall(removeHook)
 end)
 
-logNow("[GUI] Pronto. START, clicca la cassa, STOP, COPIA LOG")
+logNow("[GUI] Pronto. START, clicca la cassa, STOP. COPIA LOG seleziona il testo: tieni premuto e scegli Copia")
