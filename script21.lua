@@ -61,10 +61,13 @@ local frameStroke
 local lines = {}
 
 local function paintLogs()
-	if not logBox or logBox:IsFocused() then
+	if not logBox then
 		return
 	end
-	logBox.Text = table.concat(lines, "\n")
+	-- Do not call IsFocused: on Delta it can throw "lacking capability Plugin".
+	pcall(function()
+		logBox.Text = table.concat(lines, "\n")
+	end)
 end
 
 local function log(text)
@@ -77,16 +80,20 @@ end
 
 local function setStatus(text, color)
 	if statusLabel then
-		statusLabel.Text = tostring(text)
-		if color then
-			statusLabel.TextColor3 = color
-		end
+		pcall(function()
+			statusLabel.Text = tostring(text)
+			if color then
+				statusLabel.TextColor3 = color
+			end
+		end)
 	end
 end
 
 local function setStroke(color)
 	if frameStroke then
-		frameStroke.Color = color
+		pcall(function()
+			frameStroke.Color = color
+		end)
 	end
 end
 
@@ -106,8 +113,22 @@ local function isHash(value)
 	return type(value) == "string" and #value == 32 and string.match(value, "^%x+$") ~= nil
 end
 
+local function classNameOf(inst)
+	if typeof(inst) ~= "Instance" then
+		return nil
+	end
+	local ok, name = pcall(function()
+		return inst.ClassName
+	end)
+	if ok then
+		return name
+	end
+	return nil
+end
+
 local function isRemote(inst)
-	return typeof(inst) == "Instance" and (inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction"))
+	local className = classNameOf(inst)
+	return className == "RemoteEvent" or className == "RemoteFunction"
 end
 
 local function debugId(inst)
@@ -117,16 +138,8 @@ local function debugId(inst)
 			return tostring(id)
 		end
 	end
-	if typeof(inst) == "Instance" then
-		local ok, id = pcall(function()
-			return inst:GetDebugId()
-		end)
-		if ok then
-			return tostring(id)
-		end
-		return inst.ClassName
-	end
-	return "?"
+	local className = classNameOf(inst)
+	return className or "?"
 end
 
 local function remember(list, value)
@@ -175,9 +188,11 @@ local function copyLogs()
 		end
 	end
 	if logBox then
-		logBox:CaptureFocus()
-		logBox.CursorPosition = #logBox.Text + 1
-		logBox.SelectionStart = 1
+		pcall(function()
+			logBox:CaptureFocus()
+			logBox.CursorPosition = #logBox.Text + 1
+			logBox.SelectionStart = 1
+		end)
 	end
 	if copyBtn then
 		local old = copyBtn.Text
@@ -193,7 +208,7 @@ end
 local function resolveLibrary()
 	local framework = ReplicatedStorage:FindFirstChild("Framework")
 	local viaFramework = framework and framework:FindFirstChild("Library")
-	if viaFramework and viaFramework:IsA("ModuleScript") then
+	if viaFramework and classNameOf(viaFramework) == "ModuleScript" then
 		local ok, library = pcall(require, viaFramework)
 		if ok and type(library) == "table" then
 			local started = os.clock()
@@ -206,7 +221,7 @@ local function resolveLibrary()
 		end
 	end
 	local moduleScript = ReplicatedStorage:FindFirstChild("Library")
-	if moduleScript and moduleScript:IsA("ModuleScript") then
+	if moduleScript and classNameOf(moduleScript) == "ModuleScript" then
 		local ok, library = pcall(require, moduleScript)
 		if ok and type(library) == "table" then
 			local started = os.clock()
@@ -221,10 +236,28 @@ local function resolveLibrary()
 	return nil, "Library assente"
 end
 
-local function currentSave(library)
+local saveCache = nil
+
+local function bindSave(library)
+	saveCache = nil
 	if type(library) == "table" and type(library.Save) == "table" and type(library.Save.Get) == "function" then
 		local ok, save = pcall(library.Save.Get)
 		if ok and type(save) == "table" then
+			saveCache = save
+			return true
+		end
+	end
+	return false
+end
+
+local function currentSave(library)
+	if type(saveCache) == "table" then
+		return saveCache
+	end
+	if type(library) == "table" and type(library.Save) == "table" and type(library.Save.Get) == "function" then
+		local ok, save = pcall(library.Save.Get)
+		if ok and type(save) == "table" then
+			saveCache = save
 			return save
 		end
 	end
@@ -694,7 +727,7 @@ local function sendOnRemote(remote, value)
 	bucket.method = nil
 	bucket.armed = true
 	local callOk, callErr = pcall(function()
-		if remote:IsA("RemoteFunction") then
+		if classNameOf(remote) == "RemoteFunction" then
 			remote:InvokeServer(value)
 		else
 			remote:FireServer(value)
@@ -758,12 +791,12 @@ local function run()
 		return
 	end
 	setStatus("Leggo il save")
-	local save = currentSave(library)
-	if type(save) ~= "table" then
+	if not bindSave(library) then
 		log("[INFO] Save assente. Test annullato")
 		setStatus("Save assente", Color3.fromRGB(255, 160, 120))
 		return
 	end
+	local save = currentSave(library)
 	local clocks = collectClocks(save)
 	log(string.format("[SAVE] candidati clock %d", #clocks))
 	if #clocks < 1 then
