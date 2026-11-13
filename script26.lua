@@ -1,4 +1,4 @@
--- Delta only. Race-condition probe on valid pet mutations for psx-stayso.
+-- Delta only. Accepted-mutation + cross-remote storm for psx-stayso.
 -- Dual pulse: LastSaveTimestamp + SaveVersion must both stall for 3 cycles.
 -- No trade, booth, mail, daycare. No dirty type payloads.
 
@@ -9,27 +9,23 @@ if not LocalPlayer then
 	LocalPlayer = Players.PlayerAdded:Wait()
 end
 
-local RACE_COMMANDS = {
-	{ name = "Fuse Pets", kind = "invoke" },
-	{ name = "Use Golden Machine", kind = "invoke" },
-	{ name = "Use Rainbow Machine", kind = "invoke" },
-}
-
-local POSITIONS_COMMAND = { name = "Pet Positions", kind = "fire" }
-
-local COMMANDS = {
-	RACE_COMMANDS[1],
-	RACE_COMMANDS[2],
-	RACE_COMMANDS[3],
-	POSITIONS_COMMAND,
-}
-
-local RACE_GAP = 0.05
+local FUSE_MIN = 3
+local FUSE_TAKE = 3
+local RACE_GAP = 0
 local CHECKS = 3
 local WATCH_SECONDS = 4
 local SAMPLE_STEP = 1
 local HOLD_STEP = 2.5
+local TICK_ALIGN_WAIT = 3.6
 local MAX_LINES = 600
+
+local COMMANDS = {
+	{ name = "Fuse Pets", kind = "invoke" },
+	{ name = "Use Golden Machine", kind = "invoke" },
+	{ name = "Use Rainbow Machine", kind = "invoke" },
+	{ name = "Equip Pet", kind = "invoke" },
+	{ name = "Unequip Pet", kind = "invoke" },
+}
 
 local root = _G
 pcall(function()
@@ -294,46 +290,190 @@ local function readDual(library)
 	return nil, nil
 end
 
-local function collectUids(library)
-	local uids = {}
+local function collectPets(library)
+	local pets = {}
 	local save = currentSave(library)
 	if type(save) ~= "table" or type(save.Pets) ~= "table" then
-		return uids
+		return pets
 	end
 	for _, pet in pairs(save.Pets) do
-		if type(pet) == "table" and type(pet.uid) == "string" and #pet.uid > 0 then
-			uids[#uids + 1] = pet.uid
+		if type(pet) == "table" and type(pet.uid) == "string" and #pet.uid > 0 and type(pet.id) == "string" then
+			pets[#pets + 1] = {
+				uid = pet.uid,
+				id = pet.id,
+				hc = pet.hc == true,
+				g = pet.g == true,
+				r = pet.r == true,
+				dm = pet.dm == true,
+				e = pet.e == true,
+			}
 		end
 	end
-	return uids
+	return pets
 end
 
-local function makeUidSets(uids)
-	if #uids >= 4 then
-		return { uids[1], uids[2] }, { uids[3], uids[4] }, "due_set_disgiunti"
-	end
-	if #uids >= 2 then
-		return { uids[1], uids[2] }, { uids[2], uids[1] }, "stessi_uid_ordine_invertito"
-	end
-	if #uids == 1 then
-		return { uids[1] }, { uids[1] }, "singolo_uid_ripetuto"
-	end
-	return nil, nil, "nessun_uid"
+local function groupKey(pet)
+	return string.format("%s|%s", tostring(pet.id), pet.hc and "hc" or "n")
 end
 
-local function nanInfMap(uids)
-	local map = {}
-	local nan = 0 / 0
-	for i, uid in ipairs(uids) do
-		if i > 4 then
+local function takeUids(list, count, startIndex)
+	local out = {}
+	local from = startIndex or 1
+	for i = from, math.min(#list, from + count - 1) do
+		out[#out + 1] = list[i].uid
+	end
+	return out
+end
+
+local function buildMachinePlans(pets)
+	local normalGroups = {}
+	local goldGroups = {}
+	for _, pet in ipairs(pets) do
+		if pet.dm or pet.r then
+			continue
+		end
+		local key = groupKey(pet)
+		if pet.g then
+			local group = goldGroups[key]
+			if not group then
+				group = {}
+				goldGroups[key] = group
+			end
+			group[#group + 1] = pet
+		else
+			local group = normalGroups[key]
+			if not group then
+				group = {}
+				normalGroups[key] = group
+			end
+			group[#group + 1] = pet
+		end
+	end
+
+	local plans = {}
+	local bestNormalKey, bestNormal = nil, nil
+	for key, group in pairs(normalGroups) do
+		if not bestNormal or #group > #bestNormal then
+			bestNormalKey = key
+			bestNormal = group
+		end
+	end
+	local bestGoldKey, bestGold = nil, nil
+	for key, group in pairs(goldGroups) do
+		if not bestGold or #group > #bestGold then
+			bestGoldKey = key
+			bestGold = group
+		end
+	end
+
+	if bestNormal and #bestNormal >= FUSE_MIN * 2 then
+		plans[#plans + 1] = {
+			name = "Fuse Pets",
+			kind = "invoke",
+			mode = "same_id_dual_fuse",
+			setA = takeUids(bestNormal, FUSE_TAKE, 1),
+			setB = takeUids(bestNormal, FUSE_TAKE, 1 + FUSE_TAKE),
+			note = bestNormalKey .. " x" .. tostring(#bestNormal),
+		}
+	elseif bestNormal and #bestNormal >= FUSE_MIN then
+		local setA = takeUids(bestNormal, FUSE_TAKE, 1)
+		plans[#plans + 1] = {
+			name = "Fuse Pets",
+			kind = "invoke",
+			mode = "fuse_vs_self",
+			setA = setA,
+			setB = { setA[1], setA[2], setA[3] },
+			note = bestNormalKey .. " x" .. tostring(#bestNormal),
+		}
+	end
+
+	if bestNormal and #bestNormal >= 2 then
+		local setA = takeUids(bestNormal, math.min(3, #bestNormal), 1)
+		local setB = takeUids(bestNormal, math.min(3, #bestNormal), math.max(1, #bestNormal - 2))
+		if setB[1] == setA[1] and #bestNormal >= 4 then
+			setB = takeUids(bestNormal, math.min(3, #bestNormal - 3), 4)
+		end
+		plans[#plans + 1] = {
+			name = "Use Golden Machine",
+			kind = "invoke",
+			mode = "same_id_golden",
+			setA = setA,
+			setB = setB,
+			note = bestNormalKey .. " x" .. tostring(#bestNormal),
+		}
+	end
+
+	if bestGold and #bestGold >= 2 then
+		local setA = takeUids(bestGold, math.min(3, #bestGold), 1)
+		local setB = takeUids(bestGold, math.min(3, #bestGold), math.max(1, #bestGold - 2))
+		plans[#plans + 1] = {
+			name = "Use Rainbow Machine",
+			kind = "invoke",
+			mode = "same_id_rainbow",
+			setA = setA,
+			setB = setB,
+			note = bestGoldKey .. " x" .. tostring(#bestGold),
+		}
+	end
+
+	local equipUid, unequipUid = nil, nil
+	for _, pet in ipairs(pets) do
+		if pet.e and not unequipUid then
+			unequipUid = pet.uid
+		elseif (not pet.e) and not equipUid then
+			equipUid = pet.uid
+		end
+		if equipUid and unequipUid then
 			break
 		end
-		map[uid] = Vector3.new(nan, math.huge, -math.huge)
 	end
-	if next(map) == nil then
-		map["probe"] = Vector3.new(nan, math.huge, -math.huge)
+	if equipUid or unequipUid then
+		plans[#plans + 1] = {
+			name = "Equip/Unequip cross",
+			kind = "cross",
+			mode = "equip_unequip",
+			equipUid = equipUid,
+			unequipUid = unequipUid,
+			note = string.format("equip=%s unequip=%s", tostring(equipUid), tostring(unequipUid)),
+		}
 	end
-	return map
+
+	return plans, bestNormal and #bestNormal or 0, bestGold and #bestGold or 0
+end
+
+local function waitNearSaveTick(library)
+	local firstA, firstB = readDual(library)
+	if not (realNumber(firstA) and realNumber(firstB)) then
+		return false, "missing"
+	end
+	log("[CLOCK] Allineo allo scatto save (~4s)...")
+	local deadline = os.clock() + 6
+	local lastA, lastB = firstA, firstB
+	while running and os.clock() < deadline do
+		if not waitSeconds(0.05) then
+			return false, "stop"
+		end
+		local nowA, nowB = readDual(library)
+		if not (realNumber(nowA) and realNumber(nowB)) then
+			return false, "errore"
+		end
+		if nowA ~= lastA or nowB ~= lastB then
+			log(string.format(
+				"[CLOCK] Scatto visto | LastSaveTimestamp %s -> %s | SaveVersion %s -> %s | attendo %.1fs verso write",
+				tostring(lastA),
+				tostring(nowA),
+				tostring(lastB),
+				tostring(nowB),
+				TICK_ALIGN_WAIT
+			))
+			if not waitSeconds(TICK_ALIGN_WAIT) then
+				return false, "stop"
+			end
+			return true, nil
+		end
+	end
+	log("[CLOCK] Nessuno scatto in 6s, lancio comunque")
+	return true, "no_tick"
 end
 
 local function observeDualBaseline(library)
@@ -790,22 +930,24 @@ local function sendLoose(library, command, args)
 	return bucket.hits, capture, callOk, callErr, method
 end
 
-local function invokeOne(library, command, remote, uidSet)
+local function invokeNamed(library, remotes, name, payload)
+	local remote = remotes[name]
 	if remote then
 		if classNameOf(remote) == "RemoteFunction" then
-			remote:InvokeServer(uidSet)
-		else
-			remote:FireServer(uidSet)
+			return remote:InvokeServer(payload)
 		end
-	elseif command.kind == "invoke" then
-		library.Network.Invoke(command.name, uidSet)
-	else
-		library.Network.Fire(command.name, uidSet)
+		remote:FireServer(payload)
+		return true, "fired"
 	end
+	if type(library.Network.Invoke) == "function" then
+		return library.Network.Invoke(name, payload)
+	end
+	library.Network.Fire(name, payload)
+	return true, "fired"
 end
 
-local function sendRace(library, command, remotes, setA, setB)
-	local remote = remotes[command.name]
+local function sendDualRace(library, remotes, name, setA, setB)
+	local remote = remotes[name]
 	bucket.hits = 0
 	bucket.foreign = 0
 	bucket.expect = nil
@@ -815,29 +957,38 @@ local function sendRace(library, command, remotes, setA, setB)
 	bucket.loose = remote == nil
 	bucket.method = nil
 	bucket.armed = true
+	local resultA, resultB = nil, nil
 	local errA, errB = nil, nil
+	local doneA, doneB = false, false
 	task.spawn(function()
-		local ok, err = pcall(invokeOne, library, command, remotes[command.name], setA)
-		if not ok then
-			errA = err
+		local ok, a, b = pcall(invokeNamed, library, remotes, name, setA)
+		if ok then
+			resultA = { a, b }
+		else
+			errA = a
 		end
+		doneA = true
 	end)
-	task.wait(RACE_GAP)
+	if RACE_GAP > 0 then
+		task.wait(RACE_GAP)
+	end
 	task.spawn(function()
-		local ok, err = pcall(invokeOne, library, command, remotes[command.name], setB)
-		if not ok then
-			errB = err
+		local ok, a, b = pcall(invokeNamed, library, remotes, name, setB)
+		if ok then
+			resultB = { a, b }
+		else
+			errB = a
 		end
+		doneB = true
 	end)
-	local deadline = os.clock() + 1.5
-	while running and bucket.hits < 1 and os.clock() < deadline do
+	local deadline = os.clock() + 2.5
+	while running and (not doneA or not doneB) and os.clock() < deadline do
 		task.wait(0.05)
 	end
-	-- Give the second invoke a moment to land.
-	task.wait(0.15)
+	task.wait(0.05)
 	if bucket.loose and typeof(bucket.capture) == "Instance" then
-		remotes[command.name] = bucket.capture
-		log(string.format("[REMOTE] %s visto id %s (%s)", command.name, debugId(bucket.capture), bucket.capture.ClassName))
+		remotes[name] = bucket.capture
+		log(string.format("[REMOTE] %s visto id %s (%s)", name, debugId(bucket.capture), bucket.capture.ClassName))
 	end
 	local hits = bucket.hits
 	local method = bucket.method
@@ -846,13 +997,88 @@ local function sendRace(library, command, remotes, setA, setB)
 	bucket.expectAny = false
 	bucket.remote = nil
 	bucket.capture = nil
-	if errA then
+	local accepted = false
+	if resultA then
+		log(string.format("[RET] %s A -> %s | %s", name, tostring(resultA[1]), tostring(resultA[2])))
+		if resultA[1] == true then
+			accepted = true
+		end
+	elseif errA then
 		log("[NET] race A fallita: " .. tostring(errA))
 	end
-	if errB then
+	if resultB then
+		log(string.format("[RET] %s B -> %s | %s", name, tostring(resultB[1]), tostring(resultB[2])))
+		if resultB[1] == true then
+			accepted = true
+		end
+	elseif errB then
 		log("[NET] race B fallita: " .. tostring(errB))
 	end
-	return hits, method
+	return hits, method, accepted
+end
+
+local function sendCrossStorm(library, remotes, plans)
+	bucket.hits = 0
+	bucket.foreign = 0
+	bucket.expect = nil
+	bucket.expectAny = true
+	bucket.remote = nil
+	bucket.capture = nil
+	bucket.loose = true
+	bucket.method = nil
+	bucket.armed = true
+	local results = {}
+	local pending = 0
+	local function launch(label, name, payload)
+		pending += 1
+		task.spawn(function()
+			local ok, a, b = pcall(invokeNamed, library, remotes, name, payload)
+			if ok then
+				results[#results + 1] = { label = label, ok = a, msg = b }
+			else
+				results[#results + 1] = { label = label, err = a }
+			end
+			pending -= 1
+		end)
+	end
+	for _, plan in ipairs(plans) do
+		if plan.kind == "cross" then
+			if plan.equipUid then
+				launch("Equip Pet", "Equip Pet", plan.equipUid)
+			end
+			if plan.unequipUid then
+				launch("Unequip Pet", "Unequip Pet", plan.unequipUid)
+			end
+		elseif plan.setA then
+			launch(plan.name .. " A", plan.name, plan.setA)
+			if plan.setB then
+				launch(plan.name .. " B", plan.name, plan.setB)
+			end
+		end
+	end
+	local deadline = os.clock() + 3
+	while running and pending > 0 and os.clock() < deadline do
+		task.wait(0.05)
+	end
+	task.wait(0.1)
+	local hits = bucket.hits
+	local method = bucket.method
+	bucket.armed = false
+	bucket.loose = false
+	bucket.expectAny = false
+	bucket.capture = nil
+	local accepted = 0
+	for _, row in ipairs(results) do
+		if row.err then
+			log(string.format("[RET] %s ERR %s", row.label, tostring(row.err)))
+		else
+			log(string.format("[RET] %s -> %s | %s", row.label, tostring(row.ok), tostring(row.msg)))
+			if row.ok == true then
+				accepted += 1
+			end
+		end
+	end
+	return hits, method, accepted
 end
 
 local function run()
@@ -869,15 +1095,33 @@ local function run()
 		setStatus("Save assente", Color3.fromRGB(255, 160, 120))
 		return
 	end
-	local uids = collectUids(library)
-	local setA, setB, setMode = makeUidSets(uids)
-	log(string.format("[SAVE] pet UID trovati: %d | set mode: %s", #uids, tostring(setMode)))
-	if not setA or not setB then
-		log("[INFO] Servono pet in inventario per la race. Test annullato")
-		setStatus("UID assenti", Color3.fromRGB(255, 160, 120))
+	local pets = collectPets(library)
+	local plans, normalBest, goldBest = buildMachinePlans(pets)
+	log(string.format(
+		"[SAVE] pet=%d | miglior gruppo normal=%d gold=%d | piani=%d",
+		#pets,
+		normalBest,
+		goldBest,
+		#plans
+	))
+	if #plans == 0 then
+		log("[INFO] Nessun set valido (Fuse vuole >=3 stesso id; Golden normal; Rainbow gold). Test annullato")
+		setStatus("Set invalidi", Color3.fromRGB(255, 160, 120))
 		return
 	end
-	log(string.format("[SAVE] setA=%s | setB=%s", table.concat(setA, ","), table.concat(setB, ",")))
+	for _, plan in ipairs(plans) do
+		if plan.kind == "cross" then
+			log(string.format("[PLAN] %s | %s", plan.mode, plan.note))
+		else
+			log(string.format(
+				"[PLAN] %s | %s | A=%s | B=%s",
+				plan.name,
+				plan.note,
+				table.concat(plan.setA or {}, ","),
+				table.concat(plan.setB or {}, ",")
+			))
+		end
+	end
 	log("[CLOCK] Baseline 4s su LastSaveTimestamp + SaveVersion")
 	local baseline, why = observeDualBaseline(library)
 	if not running or why == "stop" then
@@ -907,7 +1151,7 @@ local function run()
 	end
 	setStatus("Cerco i remote")
 	local remotes, blocked = scanNetwork(library, true)
-	log("[REMOTE] Race automatica via Network. Nessuna azione in gioco.")
+	log("[REMOTE] Mutazioni accettate + storm cross. Nessuna azione in gioco.")
 	if not running then
 		return
 	end
@@ -915,75 +1159,94 @@ local function run()
 		setStatus("Hook assente", Color3.fromRGB(255, 160, 120))
 		return
 	end
-	for _, command in ipairs(RACE_COMMANDS) do
+
+	-- Pass 1: per-machine dual race with valid same-id sets, only hold if server accepts.
+	for _, plan in ipairs(plans) do
 		if not running then
 			return
 		end
-		if blocked[command.name] then
-			log("[REMOTE] " .. command.name .. " ambiguo, salto")
+		if plan.kind == "cross" or not plan.setA then
 			continue
 		end
-		log(string.format("[TEST] Race su %s | gap %.2fs | due Invoke quasi insieme", command.name, RACE_GAP))
-		setStatus("Race " .. command.name)
-		local hits, method = sendRace(library, command, remotes, setA, setB)
+		if blocked[plan.name] then
+			log("[REMOTE] " .. plan.name .. " ambiguo, salto")
+			continue
+		end
+		local aligned, alignWhy = waitNearSaveTick(library)
+		if not running or alignWhy == "stop" then
+			return
+		end
+		if not aligned and alignWhy == "missing" then
+			log("[INFO] Allineamento fallito")
+			continue
+		end
+		log(string.format("[TEST] Dual race %s | mode=%s | gap=%s", plan.name, plan.mode, tostring(RACE_GAP)))
+		setStatus("Race " .. plan.name)
+		local hits, method, accepted = sendDualRace(library, remotes, plan.name, plan.setA, plan.setB)
 		if not running then
 			return
 		end
+		log(string.format(
+			"[NET] %s | hits=%d via %s | accepted=%s",
+			plan.name,
+			hits,
+			method or "Network",
+			tostring(accepted)
+		))
 		if hits < 1 then
-			log(string.format("[NET] %s | race | nessun invio", command.name))
 			log("[SYNC] Skip hold: pacchetto non uscito")
 			continue
 		end
-		log(string.format("[NET] %s | race | hits=%d via %s", command.name, hits, method or "Network"))
-		log("[SYNC] Hold duale dopo race " .. command.name)
+		if not accepted then
+			log("[SYNC] Skip hold: server ha rifiutato entrambi (nessuna mutazione save)")
+			continue
+		end
+		log("[SYNC] Hold duale dopo mutazione accettata su " .. plan.name)
 		local frozen = holdDual(library)
 		if not running then
 			return
 		end
 		if frozen then
-			log(string.format("[SAVE FROZEN] Race condition rilevata su %s", command.name))
+			log(string.format("[SAVE FROZEN] Race su mutazione accettata: %s", plan.name))
 			setStatus("SAVE FROZEN", Color3.fromRGB(255, 90, 90))
 			setStroke(Color3.fromRGB(210, 50, 50))
 			return
 		end
 	end
-	log("[TEST] Race negative. Ultimo tentativo: Pet Positions con Vector3 NaN/inf")
-	setStatus("Pet Positions NaN")
-	local posMap = nanInfMap(uids)
-	local posArgs = { posMap }
-	local posRemote = remotes[POSITIONS_COMMAND.name]
-	local hits = 0
-	local foreign = 0
-	local callOk = true
-	local callErr = nil
-	local method = nil
-	if posRemote and not blocked[POSITIONS_COMMAND.name] then
-		hits, foreign, callOk, callErr, method = sendArgs(posRemote, posArgs)
-	else
-		local capture
-		hits, capture, callOk, callErr, method = sendLoose(library, POSITIONS_COMMAND, posArgs)
-		foreign = 0
-		if hits > 0 and typeof(capture) == "Instance" then
-			log(string.format("[REMOTE] Pet Positions visto id %s (%s)", debugId(capture), capture.ClassName))
+
+	-- Pass 2: cross-remote storm near save tick.
+	log("[TEST] Cross-remote storm su tutti i piani validi vicino al write")
+	setStatus("Cross storm")
+	local aligned, alignWhy = waitNearSaveTick(library)
+	if not running or alignWhy == "stop" then
+		return
+	end
+	if aligned or alignWhy == "no_tick" then
+		local hits, method, accepted = sendCrossStorm(library, remotes, plans)
+		log(string.format(
+			"[NET] storm | hits=%d via %s | accepted=%d",
+			hits,
+			method or "Network",
+			accepted
+		))
+		if hits >= 1 then
+			log("[SYNC] Hold duale dopo cross storm")
+			local frozen = holdDual(library)
+			if not running then
+				return
+			end
+			if frozen then
+				log("[SAVE FROZEN] Cross-remote storm ha fermato il save")
+				setStatus("SAVE FROZEN", Color3.fromRGB(255, 90, 90))
+				setStroke(Color3.fromRGB(210, 50, 50))
+				return
+			end
+		else
+			log("[NET] storm | nessun invio")
 		end
 	end
-	if not callOk then
-		log("[NET] Pet Positions fallito: " .. tostring(callErr))
-	end
-	if hits >= 1 and foreign == 0 then
-		log(string.format("[NET] Pet Positions | NaN/inf map | confermato via %s", method or "Network"))
-		log("[SYNC] Hold duale dopo Pet Positions")
-		local frozen = holdDual(library)
-		if frozen then
-			log("[SAVE FROZEN] Race condition rilevata su Pet Positions")
-			setStatus("SAVE FROZEN", Color3.fromRGB(255, 90, 90))
-			setStroke(Color3.fromRGB(210, 50, 50))
-			return
-		end
-	else
-		log("[NET] Pet Positions | NaN/inf map | nessun invio")
-	end
-	log("[SYNC] Nessuna race ha fermato LastSaveTimestamp e SaveVersion per 3 cicli.")
+
+	log("[SYNC] Nessuna mutazione accettata ha fermato LastSaveTimestamp e SaveVersion per 3 cicli.")
 	setStatus("Save vivo", Color3.fromRGB(120, 220, 140))
 	setStroke(Color3.fromRGB(40, 150, 80))
 end
@@ -1212,5 +1475,5 @@ logBox.FocusLost:Connect(function()
 	scrollLogsToBottom()
 end)
 
-log("[GUI] Solo START. Race pet + Pet Positions NaN. Trascina dal titolo.")
-log("[GUI] Scroll a destra sui log. Polso: LastSaveTimestamp + SaveVersion.")
+log("[GUI] Solo START. Set validi + storm sul tick save. Trascina dal titolo.")
+log("[GUI] Scroll sui log. Polso: LastSaveTimestamp + SaveVersion. Guarda [RET]/")
