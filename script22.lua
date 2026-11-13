@@ -1,6 +1,6 @@
--- Delta only. Pulse the live save clock, isolate toggle remotes, send dirty
--- payloads, then verdict: three missed pulse cycles = save interruption.
--- No trade. No farm.
+-- Delta only. Tier A/B save-freeze probe for psx-stayso.
+-- Dual pulse: LastSaveTimestamp + SaveVersion must both stall for 3 cycles.
+-- No trade, booth, mail, daycare. No new files; this is the stayso test script.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -9,17 +9,26 @@ if not LocalPlayer then
 	LocalPlayer = Players.PlayerAdded:Wait()
 end
 
+-- Priority: Open Gift -> pet machines -> positions/orbs.
 local COMMANDS = {
-	"Toggle Setting",
-	"Toggle Auto Hatch Setting",
-	"Toggle Auto Delete",
+	{ name = "Open Gift", kind = "invoke", shape = "gift" },
+	{ name = "Fuse Pets", kind = "invoke", shape = "uids" },
+	{ name = "Use Golden Machine", kind = "invoke", shape = "uids" },
+	{ name = "Use Rainbow Machine", kind = "invoke", shape = "uids" },
+	{ name = "Enchant Pets", kind = "invoke", shape = "enchant" },
+	{ name = "Delete Several Pets", kind = "invoke", shape = "delete" },
+	{ name = "Pet Positions", kind = "fire", shape = "positions" },
+	{ name = "Claim Orbs", kind = "fire", shape = "orbs" },
+	{ name = "Collect Lootbag", kind = "fire", shape = "lootbag" },
 }
-local PAYLOADS = { "0", "{}" }
+
+local PAYLOAD_STEPS = { "valid_1_uid", "{0}", "{}", "{nil}", "string" }
+local CHECKS = 3
 local WATCH_SECONDS = 6
 local SAMPLE_STEP = 1
-local CHECKS = 3
-local LEARN_SECONDS = 25
-local MAX_LINES = 500
+local HOLD_STEP = 4
+local LEARN_SECONDS = 20
+local MAX_LINES = 600
 
 local root = _G
 pcall(function()
@@ -59,12 +68,13 @@ local copyBtn
 local logBox
 local frameStroke
 local lines = {}
+local saveCache = nil
 
 local function paintLogs()
 	if not logBox then
 		return
 	end
-	-- Do not call IsFocused: on Delta it can throw "lacking capability Plugin".
+	-- Never call IsFocused: Delta can throw "lacking capability Plugin".
 	pcall(function()
 		logBox.Text = table.concat(lines, "\n")
 	end)
@@ -138,8 +148,7 @@ local function debugId(inst)
 			return tostring(id)
 		end
 	end
-	local className = classNameOf(inst)
-	return className or "?"
+	return classNameOf(inst) or "?"
 end
 
 local function remember(list, value)
@@ -149,13 +158,6 @@ local function remember(list, value)
 		end
 	end
 	list[#list + 1] = value
-end
-
-local function payloadValue(label)
-	if label == "0" then
-		return 0
-	end
-	return {}
 end
 
 local function copyLogs()
@@ -215,7 +217,7 @@ local function resolveLibrary()
 			while running and library.Loaded ~= true and os.clock() - started < 8 do
 				task.wait(0.1)
 			end
-			if type(library.Network) == "table" and (type(library.Network.Invoke) == "function" or type(library.Network.Fire) == "function") then
+			if type(library.Network) == "table" then
 				return library, "Framework.Library"
 			end
 		end
@@ -235,8 +237,6 @@ local function resolveLibrary()
 	end
 	return nil, "Library assente"
 end
-
-local saveCache = nil
 
 local function bindSave(library)
 	saveCache = nil
@@ -264,108 +264,185 @@ local function currentSave(library)
 	return nil
 end
 
-local function collectClocks(save)
-	local list = {}
+local function readDual(library)
+	local save = currentSave(library)
 	if type(save) ~= "table" then
-		return list
+		return nil, nil
 	end
-	for key, value in pairs(save) do
-		if type(key) == "string" and realNumber(value) then
-			local lower = string.lower(key)
-			local interesting = key == "FreeGiftsTime"
-				or key == "FreeGiftsResetTime"
-				or key == "LastSaveTimestamp"
-				or string.find(lower, "time", 1, true)
-				or string.find(lower, "tick", 1, true)
-				or string.find(lower, "save", 1, true)
-				or string.find(lower, "age", 1, true)
-			if interesting then
-				list[#list + 1] = {
-					key = key,
-					value = value,
-					prefer = key == "FreeGiftsTime",
-				}
-			end
-		end
+	local a = save.LastSaveTimestamp
+	local b = save.SaveVersion
+	if realNumber(a) and realNumber(b) then
+		return a, b
 	end
-	table.sort(list, function(a, b)
-		if a.prefer ~= b.prefer then
-			return a.prefer
-		end
-		return a.key < b.key
-	end)
-	return list
+	return nil, nil
 end
 
-local function observeClocks(library, clocks)
-	local first = {}
-	local last = {}
-	local changes = {}
-	local stamps = {}
-	for _, item in ipairs(clocks) do
-		first[item.key] = item.value
-		last[item.key] = item.value
-		changes[item.key] = 0
-		stamps[item.key] = { os.clock() }
+local function pickOwnedUid(library)
+	local save = currentSave(library)
+	if type(save) ~= "table" or type(save.Pets) ~= "table" then
+		return nil, nil
 	end
+	for _, pet in pairs(save.Pets) do
+		if type(pet) == "table" and type(pet.uid) == "string" and #pet.uid > 0 then
+			return pet.uid, tostring(pet.id)
+		end
+	end
+	return nil, nil
+end
+
+local function buildPayload(shape, step, uid, petId)
+	if step == "valid_1_uid" then
+		if shape == "delete" then
+			return nil, "skip_valid_delete"
+		end
+		if not uid then
+			return nil, "no_uid"
+		end
+		if shape == "gift" then
+			return { { uid }, petId or tostring(uid), false, false }, nil
+		end
+		if shape == "enchant" then
+			return { { uid }, false }, nil
+		end
+		if shape == "positions" then
+			return { { [uid] = Vector3.new(0, 0, 0) } }, nil
+		end
+		if shape == "orbs" then
+			return { { "orb_probe_1" } }, nil
+		end
+		if shape == "lootbag" then
+			return { "loot_probe_1", Vector3.new(0, 0, 0) }, nil
+		end
+		return { { uid } }, nil
+	end
+	if step == "{0}" then
+		if shape == "lootbag" then
+			return { 0, Vector3.new(0, 0, 0) }, nil
+		end
+		if shape == "gift" then
+			return { { 0 }, "0", false, false }, nil
+		end
+		if shape == "enchant" then
+			return { { 0 }, false }, nil
+		end
+		return { { 0 } }, nil
+	end
+	if step == "{}" then
+		if shape == "lootbag" then
+			return { {}, Vector3.new(0, 0, 0) }, nil
+		end
+		if shape == "gift" then
+			return { {}, "0", false, false }, nil
+		end
+		if shape == "enchant" then
+			return { {}, false }, nil
+		end
+		return { {} }, nil
+	end
+	if step == "{nil}" then
+		if shape == "lootbag" then
+			return { nil, Vector3.new(0, 0, 0) }, nil
+		end
+		if shape == "gift" then
+			return { { nil }, "0", false, false }, nil
+		end
+		if shape == "enchant" then
+			return { { nil }, false }, nil
+		end
+		return { { nil } }, nil
+	end
+	if step == "string" then
+		if shape == "lootbag" then
+			return { "invalid_type", Vector3.new(0, 0, 0) }, nil
+		end
+		if shape == "gift" then
+			return { "invalid_type", "0", false, false }, nil
+		end
+		if shape == "enchant" then
+			return { "invalid_type", false }, nil
+		end
+		return { "invalid_type" }, nil
+	end
+	return nil, "unknown_step"
+end
+
+local function observeDualBaseline(library)
+	local firstA, firstB = readDual(library)
+	if not (realNumber(firstA) and realNumber(firstB)) then
+		return nil, "missing"
+	end
+	local lastA, lastB = firstA, firstB
+	local ticksA, ticksB = 0, 0
 	local deadline = os.clock() + WATCH_SECONDS
 	while running and os.clock() < deadline do
 		if not waitSeconds(SAMPLE_STEP) then
 			return nil, "stop"
 		end
-		local save = currentSave(library)
-		if type(save) ~= "table" then
+		local nowA, nowB = readDual(library)
+		if not (realNumber(nowA) and realNumber(nowB)) then
 			return nil, "errore"
 		end
-		for _, item in ipairs(clocks) do
-			local now = save[item.key]
-			if realNumber(now) then
-				if realNumber(last[item.key]) and now ~= last[item.key] then
-					changes[item.key] = (changes[item.key] or 0) + 1
-					stamps[item.key][#stamps[item.key] + 1] = os.clock()
-				end
-				last[item.key] = now
-			end
+		if nowA ~= lastA then
+			ticksA += 1
+			lastA = nowA
+		end
+		if nowB ~= lastB then
+			ticksB += 1
+			lastB = nowB
 		end
 	end
-	return { first = first, last = last, changes = changes, stamps = stamps }, nil
+	return {
+		firstA = firstA,
+		firstB = firstB,
+		lastA = lastA,
+		lastB = lastB,
+		ticksA = ticksA,
+		ticksB = ticksB,
+	}, nil
 end
 
-local function estimatePeriod(stamps)
-	if type(stamps) ~= "table" or #stamps < 2 then
-		return nil
+local function holdDual(library)
+	local prevA, prevB = readDual(library)
+	if not (realNumber(prevA) and realNumber(prevB)) then
+		log("[INFO] Polso duale illeggibile. Skip check")
+		return false
 	end
-	local gaps = {}
-	for i = 2, #stamps do
-		gaps[#gaps + 1] = stamps[i] - stamps[i - 1]
-	end
-	table.sort(gaps)
-	return gaps[math.ceil(#gaps / 2)]
-end
-
-local function pickPulse(clocks, report)
-	local preferred = nil
-	local preferredTicks = 0
-	local best = nil
-	local bestTicks = 0
-	for _, item in ipairs(clocks) do
-		local ticks = report.changes[item.key] or 0
-		if item.key == "FreeGiftsTime" and ticks > preferredTicks then
-			preferred = item
-			preferredTicks = ticks
+	local holdCount = 0
+	for index = 1, CHECKS do
+		setStatus(string.format("Hold %d/%d", index, CHECKS))
+		if not waitSeconds(HOLD_STEP) then
+			return false
 		end
-		if ticks > bestTicks then
-			best = item
-			bestTicks = ticks
+		local nowA, nowB = readDual(library)
+		if not (realNumber(nowA) and realNumber(nowB)) then
+			log(string.format("[SYNC] Check %d: illeggibile | holdCount=%d", index, holdCount))
+			holdCount = 0
+		elseif nowA == prevA and nowB == prevB then
+			holdCount += 1
+			log(string.format(
+				"[SYNC] Check %d: entrambi fermi | LastSaveTimestamp=%s SaveVersion=%s | holdCount=%d",
+				index,
+				tostring(nowA),
+				tostring(nowB),
+				holdCount
+			))
+		else
+			holdCount = 0
+			log(string.format(
+				"[SYNC] Check %d: avanza | LastSaveTimestamp %s -> %s | SaveVersion %s -> %s",
+				index,
+				tostring(prevA),
+				tostring(nowA),
+				tostring(prevB),
+				tostring(nowB)
+			))
+			prevA, prevB = nowA, nowB
+		end
+		if holdCount >= 3 then
+			return true
 		end
 	end
-	if preferred and preferredTicks > 0 then
-		return preferred, preferredTicks
-	end
-	if best and bestTicks > 0 then
-		return best, bestTicks
-	end
-	return nil, 0
+	return false
 end
 
 local function listUpvalues(fn)
@@ -402,9 +479,7 @@ end
 local function listProtos(fn)
 	local readers = {}
 	if type(getprotos) == "function" then
-		readers[#readers + 1] = function(f)
-			return getprotos(f)
-		end
+		readers[#readers + 1] = getprotos
 	end
 	if type(getproto) == "function" then
 		readers[#readers + 1] = function(f)
@@ -431,22 +506,27 @@ local function listProtos(fn)
 	return nil
 end
 
-local function considerMap(tbl, maps, depth)
+local function commandNames()
+	local names = {}
+	for _, command in ipairs(COMMANDS) do
+		names[#names + 1] = command.name
+	end
+	return names
+end
+
+local function considerMap(tbl, maps, depth, names)
 	if type(tbl) ~= "table" or depth > 4 or maps.seen[tbl] then
 		return
 	end
 	maps.seen[tbl] = true
 	local commandLike = 0
 	local remoteLike = 0
-	local hashLike = 0
 	for key, value in pairs(tbl) do
 		if type(key) == "string" then
-			for _, command in ipairs(COMMANDS) do
-				if key == command then
+			for _, name in ipairs(names) do
+				if key == name then
 					commandLike += 1
-					if isHash(value) then
-						hashLike += 1
-					elseif isRemote(value) then
+					if isRemote(value) then
 						local list = maps.direct[key]
 						if not list then
 							list = {}
@@ -468,20 +548,15 @@ local function considerMap(tbl, maps, depth)
 		remember(maps.remoteMaps, tbl)
 	end
 	if type(tbl[1]) == "table" then
-		considerMap(tbl[1], maps, depth + 1)
+		considerMap(tbl[1], maps, depth + 1, names)
 	end
 	if type(tbl[2]) == "table" then
-		considerMap(tbl[2], maps, depth + 1)
+		considerMap(tbl[2], maps, depth + 1, names)
 	end
 end
 
-local function mapsFromFunction(fn)
-	local maps = {
-		seen = {},
-		commandMaps = {},
-		remoteMaps = {},
-		direct = {},
-	}
+local function mapsFromFunction(fn, names)
+	local maps = { seen = {}, commandMaps = {}, remoteMaps = {}, direct = {} }
 	local seenFn = {}
 	local function visit(func, depth)
 		if type(func) ~= "function" or depth > 6 or seenFn[func] then
@@ -492,7 +567,7 @@ local function mapsFromFunction(fn)
 		if type(ups) == "table" then
 			for _, value in pairs(ups) do
 				if type(value) == "table" then
-					considerMap(value, maps, 0)
+					considerMap(value, maps, 0, names)
 				elseif type(value) == "function" then
 					visit(value, depth + 1)
 				end
@@ -517,7 +592,7 @@ local function mapsFromFunction(fn)
 	return maps
 end
 
-local function remotesFromMaps(maps, quiet)
+local function remotesFromMaps(maps, names, quiet)
 	local found = {}
 	local blocked = {}
 	local function say(text)
@@ -525,9 +600,9 @@ local function remotesFromMaps(maps, quiet)
 			log(text)
 		end
 	end
-	for _, command in ipairs(COMMANDS) do
+	for _, name in ipairs(names) do
 		local list = {}
-		local direct = maps.direct[command]
+		local direct = maps.direct[name]
 		if direct then
 			for _, inst in ipairs(direct) do
 				remember(list, inst)
@@ -536,7 +611,7 @@ local function remotesFromMaps(maps, quiet)
 		for _, map in ipairs(maps.commandMaps) do
 			local hash = nil
 			pcall(function()
-				hash = map[command]
+				hash = map[name]
 			end)
 			if isHash(hash) then
 				for _, remotes in ipairs(maps.remoteMaps) do
@@ -556,19 +631,18 @@ local function remotesFromMaps(maps, quiet)
 			end
 		end
 		if #list == 1 then
-			found[command] = list[1]
-			say(string.format("[REMOTE] %s isolato id %s (%s)", command, debugId(list[1]), list[1].ClassName))
+			found[name] = list[1]
+			say(string.format("[REMOTE] %s isolato id %s (%s)", name, debugId(list[1]), list[1].ClassName))
 		elseif #list > 1 then
-			blocked[command] = true
-			say("[REMOTE] " .. command .. " ambiguo, non inviato")
-		else
-			say("[REMOTE] " .. command .. " assente dalla cache")
+			blocked[name] = true
+			say("[REMOTE] " .. name .. " ambiguo")
 		end
 	end
 	return found, blocked
 end
 
-local function scanNetwork(library)
+local function scanNetwork(library, quiet)
+	local names = commandNames()
 	local found = {}
 	local blocked = {}
 	local network = library and library.Network
@@ -576,88 +650,83 @@ local function scanNetwork(library)
 		return found, blocked
 	end
 	local maps = { seen = {}, commandMaps = {}, remoteMaps = {}, direct = {} }
-	if type(network.Invoke) == "function" then
-		local part = mapsFromFunction(network.Invoke)
-		for _, map in ipairs(part.commandMaps) do
-			remember(maps.commandMaps, map)
-		end
-		for _, map in ipairs(part.remoteMaps) do
-			remember(maps.remoteMaps, map)
-		end
-		for key, list in pairs(part.direct) do
-			maps.direct[key] = list
-		end
-	end
-	if type(network.Fire) == "function" then
-		local part = mapsFromFunction(network.Fire)
-		for _, map in ipairs(part.commandMaps) do
-			remember(maps.commandMaps, map)
-		end
-		for _, map in ipairs(part.remoteMaps) do
-			remember(maps.remoteMaps, map)
-		end
-		for key, list in pairs(part.direct) do
-			local dest = maps.direct[key]
-			if not dest then
-				maps.direct[key] = list
-			else
-				for _, inst in ipairs(list) do
-					remember(dest, inst)
+	for _, fnName in ipairs({ "Invoke", "Fire" }) do
+		local fn = network[fnName]
+		if type(fn) == "function" then
+			local part = mapsFromFunction(fn, names)
+			for _, map in ipairs(part.commandMaps) do
+				remember(maps.commandMaps, map)
+			end
+			for _, map in ipairs(part.remoteMaps) do
+				remember(maps.remoteMaps, map)
+			end
+			for key, list in pairs(part.direct) do
+				local dest = maps.direct[key]
+				if not dest then
+					maps.direct[key] = list
+				else
+					for _, inst in ipairs(list) do
+						remember(dest, inst)
+					end
 				end
 			end
 		end
 	end
-	found, blocked = remotesFromMaps(maps, false)
+	found, blocked = remotesFromMaps(maps, names, quiet)
 	return found, blocked
 end
 
 local function learnFromPlay(library, found, blocked)
+	local names = commandNames()
 	local pending = false
-	for _, command in ipairs(COMMANDS) do
-		if not found[command] and not blocked[command] then
+	for _, name in ipairs(names) do
+		if not found[name] and not blocked[name] then
 			pending = true
 		end
 	end
 	if not pending then
 		return
 	end
-	log("[REMOTE] Cache vuota. Hai 25s: cambia un'impostazione e un toggle Auto Hatch/Delete.")
+	log("[REMOTE] Cache incompleta. Hai 20s: apri gift/macchine/orbs in gioco se puoi, altrimenti uso Network diretto.")
 	local deadline = os.clock() + LEARN_SECONDS
 	while running and pending and os.clock() < deadline do
-		setStatus("Toggle impostazione / auto hatch")
-		task.wait(0.4)
-		local seen, seenBlocked = scanNetwork(library)
+		setStatus("Usa gift/macchina in gioco")
+		task.wait(0.5)
+		local seen, seenBlocked = scanNetwork(library, true)
 		pending = false
-		for _, command in ipairs(COMMANDS) do
-			if blocked[command] or seenBlocked[command] then
-				if seenBlocked[command] and not blocked[command] then
-					blocked[command] = true
-					log("[REMOTE] " .. command .. " ambiguo dopo il toggle")
+		for _, name in ipairs(names) do
+			if blocked[name] or seenBlocked[name] then
+				if seenBlocked[name] and not blocked[name] then
+					blocked[name] = true
+					log("[REMOTE] " .. name .. " ambiguo")
 				end
-			elseif seen[command] and not found[command] then
-				found[command] = seen[command]
-				log(string.format("[REMOTE] %s imparato id %s (%s)", command, debugId(seen[command]), seen[command].ClassName))
-			elseif not found[command] then
+			elseif seen[name] and not found[name] then
+				found[name] = seen[name]
+				log(string.format("[REMOTE] %s imparato id %s (%s)", name, debugId(seen[name]), seen[name].ClassName))
+			elseif not found[name] then
 				pending = true
 			end
 		end
 	end
-	for _, command in ipairs(COMMANDS) do
-		if not found[command] and not blocked[command] then
-			log("[REMOTE] " .. command .. " mai chiamato dal gioco")
-		end
-	end
 end
 
-local function argsMatch(expect, ...)
-	if select("#", ...) ~= 1 then
+local function argsEqual(expectArgs, ...)
+	local n = select("#", ...)
+	if n ~= #expectArgs then
 		return false
 	end
-	local first = ...
-	if type(expect) == "table" then
-		return first == expect
+	for i = 1, n do
+		local got = select(i, ...)
+		local want = expectArgs[i]
+		if type(want) == "table" then
+			if got ~= want then
+				return false
+			end
+		elseif got ~= want then
+			return false
+		end
 	end
-	return type(first) == "number" and first == 0 and expect == 0
+	return true
 end
 
 local function namecall(self, ...)
@@ -666,7 +735,7 @@ local function namecall(self, ...)
 		method = getnamecallmethod()
 	end
 	local state = root.__DeltaSaveFreeze
-	if state and state.armed and (method == "InvokeServer" or method == "FireServer") and argsMatch(state.expect, ...) then
+	if state and state.armed and (method == "InvokeServer" or method == "FireServer") and type(state.expect) == "table" and argsEqual(state.expect, ...) then
 		local owned = false
 		if state.remote then
 			owned = self == state.remote
@@ -717,10 +786,10 @@ local function installHook()
 	return true
 end
 
-local function sendOnRemote(remote, value)
+local function sendArgs(remote, args)
 	bucket.hits = 0
 	bucket.foreign = 0
-	bucket.expect = value
+	bucket.expect = args
 	bucket.remote = remote
 	bucket.capture = nil
 	bucket.loose = false
@@ -728,9 +797,9 @@ local function sendOnRemote(remote, value)
 	bucket.armed = true
 	local callOk, callErr = pcall(function()
 		if classNameOf(remote) == "RemoteFunction" then
-			remote:InvokeServer(value)
+			remote:InvokeServer(table.unpack(args, 1, #args))
 		else
-			remote:FireServer(value)
+			remote:FireServer(table.unpack(args, 1, #args))
 		end
 	end)
 	bucket.armed = false
@@ -739,20 +808,20 @@ local function sendOnRemote(remote, value)
 	return bucket.hits, bucket.foreign, callOk, callErr, bucket.method
 end
 
-local function sendLoose(library, command, value)
+local function sendLoose(library, command, args)
 	bucket.hits = 0
 	bucket.foreign = 0
-	bucket.expect = value
+	bucket.expect = args
 	bucket.remote = nil
 	bucket.capture = nil
 	bucket.loose = true
 	bucket.method = nil
 	bucket.armed = true
 	local callOk, callErr = pcall(function()
-		if type(library.Network.Invoke) == "function" then
-			library.Network.Invoke(command, value)
+		if command.kind == "invoke" and type(library.Network.Invoke) == "function" then
+			library.Network.Invoke(command.name, table.unpack(args, 1, #args))
 		elseif type(library.Network.Fire) == "function" then
-			library.Network.Fire(command, value)
+			library.Network.Fire(command.name, table.unpack(args, 1, #args))
 		else
 			error("Network Invoke/Fire assenti")
 		end
@@ -770,18 +839,6 @@ local function sendLoose(library, command, value)
 	return bucket.hits, capture, callOk, callErr, method
 end
 
-local function readPulse(library, key)
-	local save = currentSave(library)
-	if type(save) ~= "table" then
-		return nil
-	end
-	local value = save[key]
-	if realNumber(value) then
-		return value
-	end
-	return nil
-end
-
 local function run()
 	setStroke(Color3.fromRGB(70, 110, 170))
 	local library, source = resolveLibrary()
@@ -796,62 +853,44 @@ local function run()
 		setStatus("Save assente", Color3.fromRGB(255, 160, 120))
 		return
 	end
-	local save = currentSave(library)
-	local clocks = collectClocks(save)
-	log(string.format("[SAVE] candidati clock %d", #clocks))
-	if #clocks < 1 then
-		log("[INFO] Nessun campo tempo nel save. Test annullato")
-		setStatus("Nessun clock", Color3.fromRGB(255, 200, 120))
-		return
+	local uid, petId = pickOwnedUid(library)
+	if uid then
+		log(string.format("[SAVE] UID di prova: %s | petId %s", uid, tostring(petId)))
+	else
+		log("[SAVE] Nessun UID pet in inventario. I passi valid_1_uid saranno saltati.")
 	end
-	log("[CLOCK] Confronto di 6 secondi, un campione ogni secondo")
-	local report, why = observeClocks(library, clocks)
+	log("[CLOCK] Baseline 6s su LastSaveTimestamp + SaveVersion (FreeGiftsTime ignorato per il verdetto)")
+	local baseline, why = observeDualBaseline(library)
 	if not running or why == "stop" then
 		return
 	end
-	if why == "errore" or type(report) ~= "table" then
-		log("[INFO] Lettura clock interrotta")
-		setStatus("Clock illeggibile", Color3.fromRGB(255, 160, 120))
+	if why == "missing" or why == "errore" or type(baseline) ~= "table" then
+		log("[INFO] LastSaveTimestamp/SaveVersion non leggibili. Test annullato")
+		setStatus("Polso assente", Color3.fromRGB(255, 160, 120))
 		return
 	end
-	for _, item in ipairs(clocks) do
-		local ticks = report.changes[item.key] or 0
-		local note = "fermo"
-		if item.key == "FreeGiftsTime" and ticks > 0 then
-			note = "polso preferito"
-		elseif ticks > 0 then
-			note = "si muove"
-		elseif item.key == "LastSaveTimestamp" then
-			note = "chiave save, non usata come polso se ferma"
-		end
-		log(string.format(
-			"[CLOCK] %s | %s -> %s | scatti %d | %s",
-			item.key,
-			tostring(report.first[item.key]),
-			tostring(report.last[item.key]),
-			ticks,
-			note
-		))
-	end
-	local pulse, pulseTicks = pickPulse(clocks, report)
-	if not pulse then
-		log("[INFO] Nessun campo si muove. Senza polso non posso misurare un blocco. Verdetto non emesso")
-		setStatus("Nessun polso", Color3.fromRGB(255, 200, 120))
-		return
-	end
-	local period = estimatePeriod(report.stamps[pulse.key]) or (WATCH_SECONDS / math.max(pulseTicks, 1))
-	period = math.max(1, math.min(period, 20))
-	local holdStep = math.max(2, math.ceil(period + 1))
 	log(string.format(
-		"[CLOCK] Polso: %s | valore %s | scatti %d | periodo ~%.1fs | check ogni %ds",
-		pulse.key,
-		tostring(report.last[pulse.key]),
-		pulseTicks,
-		period,
-		holdStep
+		"[CLOCK] LastSaveTimestamp %s -> %s | scatti %d",
+		tostring(baseline.firstA),
+		tostring(baseline.lastA),
+		baseline.ticksA
 	))
+	log(string.format(
+		"[CLOCK] SaveVersion %s -> %s | scatti %d",
+		tostring(baseline.firstB),
+		tostring(baseline.lastB),
+		baseline.ticksB
+	))
+	if baseline.ticksA < 1 and baseline.ticksB < 1 then
+		log("[INFO] Entrambi i clock erano gia fermi prima dei payload. Verdetto non emesso")
+		setStatus("Polso gia fermo", Color3.fromRGB(255, 200, 120))
+		return
+	end
+	if baseline.ticksA < 1 or baseline.ticksB < 1 then
+		log("[CLOCK] Nota: un campo del polso duale non si e mosso in baseline. Serve che entrambi restino fermi dopo il payload.")
+	end
 	setStatus("Cerco i remote")
-	local remotes, blocked = scanNetwork(library)
+	local remotes, blocked = scanNetwork(library, false)
 	learnFromPlay(library, remotes, blocked)
 	if not running then
 		return
@@ -860,96 +899,81 @@ local function run()
 		setStatus("Hook assente", Color3.fromRGB(255, 160, 120))
 		return
 	end
-	local confirmed = 0
 	for _, command in ipairs(COMMANDS) do
-		if blocked[command] then
+		if not running then
+			return
+		end
+		if blocked[command.name] then
+			log("[REMOTE] " .. command.name .. " ambiguo, salto")
 			continue
 		end
-		for _, label in ipairs(PAYLOADS) do
+		log("[TEST] Comando: " .. command.name)
+		for _, step in ipairs(PAYLOAD_STEPS) do
 			if not running then
 				return
 			end
-			setStatus(command .. " " .. label)
-			local value = payloadValue(label)
-			local remote = remotes[command]
+			local args, skip = buildPayload(command.shape, step, uid, petId)
+			if skip == "skip_valid_delete" then
+				log("[TEST] Delete Several Pets | valid_1_uid saltato (evito cancellazione reale)")
+				continue
+			end
+			if skip == "no_uid" then
+				log("[TEST] " .. command.name .. " | " .. step .. " saltato (nessun UID)")
+				continue
+			end
+			if type(args) ~= "table" then
+				log("[TEST] " .. command.name .. " | " .. step .. " non costruibile")
+				continue
+			end
+			setStatus(command.name .. " " .. step)
+			local remote = remotes[command.name]
 			local hits = 0
 			local foreign = 0
 			local callOk = true
 			local callErr = nil
 			local method = nil
 			if remote then
-				hits, foreign, callOk, callErr, method = sendOnRemote(remote, value)
+				hits, foreign, callOk, callErr, method = sendArgs(remote, args)
 			else
 				local capture
-				hits, capture, callOk, callErr, method = sendLoose(library, command, value)
+				hits, capture, callOk, callErr, method = sendLoose(library, command, args)
 				foreign = 0
 				if hits > 0 and typeof(capture) == "Instance" then
-					remotes[command] = capture
-					log(string.format("[REMOTE] %s visto in Network id %s (%s)", command, debugId(capture), capture.ClassName))
+					remotes[command.name] = capture
+					log(string.format("[REMOTE] %s visto id %s (%s)", command.name, debugId(capture), capture.ClassName))
 				end
 			end
 			if not callOk then
 				log("[NET] invio fallito: " .. tostring(callErr))
 			end
 			if hits >= 1 and foreign == 0 then
-				confirmed += 1
-				log(string.format(
-					"[NET] %s | Payload: %s | confermato via %s",
-					command,
-					label,
-					method or (remote and remote.ClassName) or "Network"
-				))
+				log(string.format("[NET] %s | %s | confermato via %s", command.name, step, method or "Network"))
 			else
 				local detail = (hits == 0 and foreign == 0) and "nessun invio" or "non isolato"
-				log(string.format("[NET] %s | Payload: %s | %s", command, label, detail))
+				log(string.format("[NET] %s | %s | %s", command.name, step, detail))
 			end
-			if not waitSeconds(0.25) then
+			if hits < 1 then
+				log("[SYNC] Nessun pacchetto uscito, salto hold per questo payload")
+				continue
+			end
+			log(string.format("[SYNC] Hold duale dopo %s | %s", command.name, step))
+			local frozen = holdDual(library)
+			if frozen then
+				log(string.format(
+					"[SAVE FROZEN] Trovato il comando che blocca il salvataggio: %s con payload %s",
+					command.name,
+					step
+				))
+				setStatus("SAVE FROZEN", Color3.fromRGB(255, 90, 90))
+				setStroke(Color3.fromRGB(210, 50, 50))
+				return
+			end
+			if not waitSeconds(0.2) then
 				return
 			end
 		end
 	end
-	if confirmed < 1 then
-		log("[INFO] Nessun payload uscito. Senza pacchetto non posso giudicare il save. Verdetto non emesso")
-		setStatus("Pacchetto non uscito", Color3.fromRGB(255, 180, 90))
-		return
-	end
-	local previousValue = readPulse(library, pulse.key)
-	if not realNumber(previousValue) then
-		log("[INFO] Polso illeggibile dopo i payload. Verdetto non emesso")
-		setStatus("Polso illeggibile", Color3.fromRGB(255, 160, 120))
-		return
-	end
-	local holdCount = 0
-	local sawMove = false
-	for index = 1, CHECKS do
-		setStatus(string.format("Check %d/%d", index, CHECKS))
-		if not waitSeconds(holdStep) then
-			return
-		end
-		local now = readPulse(library, pulse.key)
-		if not realNumber(now) then
-			log(string.format("[SYNC] Check %d: illeggibile | holdCount=%d", index, holdCount))
-		elseif now == previousValue then
-			holdCount += 1
-			log(string.format("[SYNC] Check %d: fermo %s | holdCount=%d", index, tostring(now), holdCount))
-		else
-			sawMove = true
-			holdCount = 0
-			log(string.format("[SYNC] Check %d: avanza %s -> %s", index, tostring(previousValue), tostring(now)))
-			previousValue = now
-		end
-		if holdCount >= 3 then
-			log("[SAVE FROZEN] Il polso del server si e fermato per 3 cicli dopo il payload. Salvataggio interrotto.")
-			setStatus("SAVE FROZEN", Color3.fromRGB(255, 90, 90))
-			setStroke(Color3.fromRGB(210, 50, 50))
-			return
-		end
-	end
-	if sawMove then
-		log("[SYNC] Il polso continua. Nessuna interruzione del salvataggio misurata.")
-	else
-		log("[SYNC] Non ci sono tre fermate di fila. Nessuna interruzione del salvataggio misurata.")
-	end
+	log("[SYNC] Nessun payload ha fermato LastSaveTimestamp e SaveVersion per 3 cicli.")
 	setStatus("Save vivo", Color3.fromRGB(120, 220, 140))
 	setStroke(Color3.fromRGB(40, 150, 80))
 end
@@ -1041,7 +1065,7 @@ title.Font = Enum.Font.GothamBold
 title.TextSize = 16
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = Color3.fromRGB(236, 240, 248)
-title.Text = "SAVE FREEZE"
+title.Text = "SAVE FREEZE TIER A/B"
 title.Parent = frame
 
 startBtn = Instance.new("TextButton")
@@ -1113,8 +1137,10 @@ startBtn.MouseButton1Click:Connect(function()
 end)
 copyBtn.MouseButton1Click:Connect(copyLogs)
 logBox.FocusLost:Connect(function()
-	logBox.Text = table.concat(lines, "\n")
+	pcall(function()
+		logBox.Text = table.concat(lines, "\n")
+	end)
 end)
 
-log("[GUI] Pronto. 6s di polso, toggle UI se serve, poi 0 e {} sui toggle. Solo verdetto save.")
-log("[NOTA] Nessuno scambio pet in questo test.")
+log("[GUI] Pronto. Polso duale LastSaveTimestamp+SaveVersion. Tier A/B filtrata, no booth/mail/daycare.")
+log("[NOTA] Ordine: Open Gift -> macchine -> Pet Positions/Orbs/Lootbag. COPIA LOG o tieni premuto il testo.")
