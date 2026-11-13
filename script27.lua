@@ -1,6 +1,6 @@
--- Delta only. Accepted-mutation + cross-remote storm for psx-stayso.
--- Dual pulse: LastSaveTimestamp + SaveVersion must both stall for 3 cycles.
--- No trade, booth, mail, daycare. No dirty type payloads.
+-- Delta only. Claim/Redeem spam + Delete/Equip desync probe for psx-stayso.
+-- No trade, no save-freeze. No booth/mail/daycare.
+-- Verdict: same redeem payload returns true more than once = reward dupe.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -9,22 +9,19 @@ if not LocalPlayer then
 	LocalPlayer = Players.PlayerAdded:Wait()
 end
 
-local FUSE_MIN = 3
-local FUSE_TAKE = 3
-local RACE_GAP = 0
-local CHECKS = 3
-local WATCH_SECONDS = 4
-local SAMPLE_STEP = 1
-local HOLD_STEP = 2.5
-local TICK_ALIGN_WAIT = 3.6
+local SPAM_COUNT = 5
 local MAX_LINES = 600
 
 local COMMANDS = {
-	{ name = "Fuse Pets", kind = "invoke" },
-	{ name = "Use Golden Machine", kind = "invoke" },
-	{ name = "Use Rainbow Machine", kind = "invoke" },
+	{ name = "Redeem Free Gift", kind = "invoke" },
+	{ name = "Redeem Rank Rewards", kind = "invoke" },
+	{ name = "Redeem VIP Rewards", kind = "invoke" },
+	{ name = "Claim Season Reward", kind = "invoke" },
+	{ name = "ClaimLeaveBonus", kind = "invoke" },
+	{ name = "Quests: Redeem Reward", kind = "invoke" },
+	{ name = "Redeem Pet Collection", kind = "invoke" },
+	{ name = "Delete Several Pets", kind = "invoke" },
 	{ name = "Equip Pet", kind = "invoke" },
-	{ name = "Unequip Pet", kind = "invoke" },
 }
 
 local root = _G
@@ -930,23 +927,131 @@ local function sendLoose(library, command, args)
 	return bucket.hits, capture, callOk, callErr, method
 end
 
-local function invokeNamed(library, remotes, name, payload)
+local function invokeNamedArgs(library, remotes, name, ...)
+	local n = select("#", ...)
 	local remote = remotes[name]
 	if remote then
 		if classNameOf(remote) == "RemoteFunction" then
-			return remote:InvokeServer(payload)
+			if n == 0 then
+				return remote:InvokeServer()
+			end
+			return remote:InvokeServer(...)
 		end
-		remote:FireServer(payload)
+		if n == 0 then
+			remote:FireServer()
+		else
+			remote:FireServer(...)
+		end
 		return true, "fired"
 	end
 	if type(library.Network.Invoke) == "function" then
-		return library.Network.Invoke(name, payload)
+		if n == 0 then
+			return library.Network.Invoke(name)
+		end
+		return library.Network.Invoke(name, ...)
 	end
-	library.Network.Fire(name, payload)
+	if n == 0 then
+		library.Network.Fire(name)
+	else
+		library.Network.Fire(name, ...)
+	end
 	return true, "fired"
 end
 
-local function sendDualRace(library, remotes, name, setA, setB)
+local function alreadyRedeemed(redeemed, index)
+	if type(redeemed) ~= "table" then
+		return false
+	end
+	for _, value in pairs(redeemed) do
+		if value == index then
+			return true
+		end
+	end
+	return false
+end
+
+local function resolveFreeGiftsDir(library)
+	if type(library) == "table" and type(library.Directory) == "table" and type(library.Directory.FreeGifts) == "table" then
+		return library.Directory.FreeGifts
+	end
+	local ok, dir = pcall(function()
+		return require(ReplicatedStorage:WaitForChild("Library"):WaitForChild("Directory"):WaitForChild("FreeGifts"))
+	end)
+	if ok and type(dir) == "table" then
+		return dir
+	end
+	return nil
+end
+
+local function pickFreeGiftIndex(library)
+	local save = currentSave(library)
+	local redeemed = save and save.FreeGiftsRedeemed or {}
+	local giftTime = save and tonumber(save.FreeGiftsTime) or 0
+	local dir = resolveFreeGiftsDir(library)
+	if type(dir) == "table" then
+		for i, gift in ipairs(dir) do
+			if not alreadyRedeemed(redeemed, i) and giftTime >= (tonumber(gift.waitTime) or 0) then
+				return i, "ready", giftTime, redeemed
+			end
+		end
+		for i, _ in ipairs(dir) do
+			if not alreadyRedeemed(redeemed, i) then
+				return i, "not_ready", giftTime, redeemed
+			end
+		end
+		if #dir > 0 then
+			return 1, "all_redeemed", giftTime, redeemed
+		end
+	end
+	return 1, "fallback", giftTime, redeemed
+end
+
+local function petStillInSave(library, uid)
+	local save = currentSave(library)
+	if type(save) ~= "table" or type(save.Pets) ~= "table" then
+		return false
+	end
+	for _, pet in pairs(save.Pets) do
+		if type(pet) == "table" and pet.uid == uid then
+			return true, pet.e == true
+		end
+	end
+	-- Force refresh once if Save.Get available.
+	if type(library.Save) == "table" and type(library.Save.Get) == "function" then
+		local ok, fresh = pcall(library.Save.Get)
+		if ok and type(fresh) == "table" then
+			saveCache = fresh
+			if type(fresh.Pets) == "table" then
+				for _, pet in pairs(fresh.Pets) do
+					if type(pet) == "table" and pet.uid == uid then
+						return true, pet.e == true
+					end
+				end
+			end
+		end
+	end
+	return false, false
+end
+
+local function pickDeleteTarget(library)
+	local pets = collectPets(library)
+	for _, pet in ipairs(pets) do
+		if (not pet.e) and (not pet.dm) and (not pet.r) and (not pet.g) then
+			return pet.uid, pet.id
+		end
+	end
+	for _, pet in ipairs(pets) do
+		if not pet.e then
+			return pet.uid, pet.id
+		end
+	end
+	if pets[1] then
+		return pets[1].uid, pets[1].id
+	end
+	return nil, nil
+end
+
+local function spamSamePayload(library, remotes, name, args, count)
 	local remote = remotes[name]
 	bucket.hits = 0
 	bucket.foreign = 0
@@ -957,32 +1062,24 @@ local function sendDualRace(library, remotes, name, setA, setB)
 	bucket.loose = remote == nil
 	bucket.method = nil
 	bucket.armed = true
-	local resultA, resultB = nil, nil
-	local errA, errB = nil, nil
-	local doneA, doneB = false, false
-	task.spawn(function()
-		local ok, a, b = pcall(invokeNamed, library, remotes, name, setA)
-		if ok then
-			resultA = { a, b }
-		else
-			errA = a
-		end
-		doneA = true
-	end)
-	if RACE_GAP > 0 then
-		task.wait(RACE_GAP)
+	local rows = table.create(count)
+	local pending = count
+	for i = 1, count do
+		task.spawn(function()
+			local packed = args or {}
+			local ok, a, b = pcall(function()
+				return invokeNamedArgs(library, remotes, name, table.unpack(packed, 1, #packed))
+			end)
+			if ok then
+				rows[i] = { ok = true, a = a, b = b }
+			else
+				rows[i] = { ok = false, err = a }
+			end
+			pending -= 1
+		end)
 	end
-	task.spawn(function()
-		local ok, a, b = pcall(invokeNamed, library, remotes, name, setB)
-		if ok then
-			resultB = { a, b }
-		else
-			errB = a
-		end
-		doneB = true
-	end)
-	local deadline = os.clock() + 2.5
-	while running and (not doneA or not doneB) and os.clock() < deadline do
+	local deadline = os.clock() + 4
+	while running and pending > 0 and os.clock() < deadline do
 		task.wait(0.05)
 	end
 	task.wait(0.05)
@@ -997,27 +1094,32 @@ local function sendDualRace(library, remotes, name, setA, setB)
 	bucket.expectAny = false
 	bucket.remote = nil
 	bucket.capture = nil
-	local accepted = false
-	if resultA then
-		log(string.format("[RET] %s A -> %s | %s", name, tostring(resultA[1]), tostring(resultA[2])))
-		if resultA[1] == true then
-			accepted = true
+	local trueCount = 0
+	for i = 1, count do
+		local row = rows[i]
+		if not row then
+			log(string.format("[RET] %s #%d -> (timeout)", name, i))
+		elseif not row.ok then
+			log(string.format("[RET] %s #%d ERR %s", name, i, tostring(row.err)))
+		else
+			log(string.format("[RET] %s #%d -> %s | %s", name, i, tostring(row.a), tostring(row.b)))
+			if row.a == true then
+				trueCount += 1
+			end
 		end
-	elseif errA then
-		log("[NET] race A fallita: " .. tostring(errA))
 	end
-	if resultB then
-		log(string.format("[RET] %s B -> %s | %s", name, tostring(resultB[1]), tostring(resultB[2])))
-		if resultB[1] == true then
-			accepted = true
-		end
-	elseif errB then
-		log("[NET] race B fallita: " .. tostring(errB))
-	end
-	return hits, method, accepted
+	return hits, method, trueCount
 end
 
-local function sendCrossStorm(library, remotes, plans)
+local function runDeleteEquipDesync(library, remotes)
+	local uid, petId = pickDeleteTarget(library)
+	if not uid then
+		log("[INFO] Delete/Equip: nessun pet disponibile")
+		return false
+	end
+	log(string.format("[TEST] Delete+Equip stesso frame | uid=%s id=%s", uid, tostring(petId)))
+	local before = petStillInSave(library, uid)
+	log(string.format("[SAVE] pre: pet in save=%s", tostring(before)))
 	bucket.hits = 0
 	bucket.foreign = 0
 	bucket.expect = nil
@@ -1027,58 +1129,59 @@ local function sendCrossStorm(library, remotes, plans)
 	bucket.loose = true
 	bucket.method = nil
 	bucket.armed = true
-	local results = {}
-	local pending = 0
-	local function launch(label, name, payload)
-		pending += 1
-		task.spawn(function()
-			local ok, a, b = pcall(invokeNamed, library, remotes, name, payload)
-			if ok then
-				results[#results + 1] = { label = label, ok = a, msg = b }
-			else
-				results[#results + 1] = { label = label, err = a }
-			end
-			pending -= 1
-		end)
-	end
-	for _, plan in ipairs(plans) do
-		if plan.kind == "cross" then
-			if plan.equipUid then
-				launch("Equip Pet", "Equip Pet", plan.equipUid)
-			end
-			if plan.unequipUid then
-				launch("Unequip Pet", "Unequip Pet", plan.unequipUid)
-			end
-		elseif plan.setA then
-			launch(plan.name .. " A", plan.name, plan.setA)
-			if plan.setB then
-				launch(plan.name .. " B", plan.name, plan.setB)
-			end
-		end
-	end
+	local delRet, eqRet = nil, nil
+	local pending = 2
+	task.spawn(function()
+		local ok, a, b = pcall(invokeNamedArgs, library, remotes, "Delete Several Pets", { uid })
+		delRet = ok and { a, b } or { false, a }
+		pending -= 1
+	end)
+	task.spawn(function()
+		local ok, a, b = pcall(invokeNamedArgs, library, remotes, "Equip Pet", uid)
+		eqRet = ok and { a, b } or { false, a }
+		pending -= 1
+	end)
 	local deadline = os.clock() + 3
 	while running and pending > 0 and os.clock() < deadline do
 		task.wait(0.05)
 	end
-	task.wait(0.1)
-	local hits = bucket.hits
-	local method = bucket.method
+	task.wait(0.2)
 	bucket.armed = false
 	bucket.loose = false
 	bucket.expectAny = false
-	bucket.capture = nil
-	local accepted = 0
-	for _, row in ipairs(results) do
-		if row.err then
-			log(string.format("[RET] %s ERR %s", row.label, tostring(row.err)))
-		else
-			log(string.format("[RET] %s -> %s | %s", row.label, tostring(row.ok), tostring(row.msg)))
-			if row.ok == true then
-				accepted += 1
-			end
-		end
+	if delRet then
+		log(string.format("[RET] Delete Several Pets -> %s | %s", tostring(delRet[1]), tostring(delRet[2])))
+	else
+		log("[RET] Delete Several Pets -> (timeout)")
 	end
-	return hits, method, accepted
+	if eqRet then
+		log(string.format("[RET] Equip Pet -> %s | %s", tostring(eqRet[1]), tostring(eqRet[2])))
+	else
+		log("[RET] Equip Pet -> (timeout)")
+	end
+	task.wait(0.5)
+	local after, equipped = petStillInSave(library, uid)
+	log(string.format(
+		"[SAVE] post: pet in save=%s equipped=%s | deleteOk=%s equipOk=%s",
+		tostring(after),
+		tostring(equipped),
+		tostring(delRet and delRet[1]),
+		tostring(eqRet and eqRet[1])
+	))
+	-- Desync signal: delete true but pet still present, or equip true after delete true.
+	if delRet and delRet[1] == true and after then
+		log("[DESYNC] Delete true ma pet ancora in save")
+		return true
+	end
+	if delRet and delRet[1] == true and eqRet and eqRet[1] == true then
+		log("[DESYNC] Delete e Equip entrambi true sullo stesso uid")
+		return true
+	end
+	if delRet and delRet[1] == true and not after and eqRet and eqRet[1] == true then
+		log("[DESYNC?] Equip true dopo delete (pet assente in save locale)")
+		return true
+	end
+	return false
 end
 
 local function run()
@@ -1096,62 +1199,10 @@ local function run()
 		return
 	end
 	local pets = collectPets(library)
-	local plans, normalBest, goldBest = buildMachinePlans(pets)
-	log(string.format(
-		"[SAVE] pet=%d | miglior gruppo normal=%d gold=%d | piani=%d",
-		#pets,
-		normalBest,
-		goldBest,
-		#plans
-	))
-	if #plans == 0 then
-		log("[INFO] Nessun set valido (Fuse vuole >=3 stesso id; Golden normal; Rainbow gold). Test annullato")
-		setStatus("Set invalidi", Color3.fromRGB(255, 160, 120))
-		return
-	end
-	for _, plan in ipairs(plans) do
-		if plan.kind == "cross" then
-			log(string.format("[PLAN] %s | %s", plan.mode, plan.note))
-		else
-			log(string.format(
-				"[PLAN] %s | %s | A=%s | B=%s",
-				plan.name,
-				plan.note,
-				table.concat(plan.setA or {}, ","),
-				table.concat(plan.setB or {}, ",")
-			))
-		end
-	end
-	log("[CLOCK] Baseline 4s su LastSaveTimestamp + SaveVersion")
-	local baseline, why = observeDualBaseline(library)
-	if not running or why == "stop" then
-		return
-	end
-	if why == "missing" or why == "errore" or type(baseline) ~= "table" then
-		log("[INFO] LastSaveTimestamp/SaveVersion non leggibili. Test annullato")
-		setStatus("Polso assente", Color3.fromRGB(255, 160, 120))
-		return
-	end
-	log(string.format(
-		"[CLOCK] LastSaveTimestamp %s -> %s | scatti %d",
-		tostring(baseline.firstA),
-		tostring(baseline.lastA),
-		baseline.ticksA
-	))
-	log(string.format(
-		"[CLOCK] SaveVersion %s -> %s | scatti %d",
-		tostring(baseline.firstB),
-		tostring(baseline.lastB),
-		baseline.ticksB
-	))
-	if baseline.ticksA < 1 and baseline.ticksB < 1 then
-		log("[INFO] Entrambi i clock erano gia fermi prima della race. Verdetto non emesso")
-		setStatus("Polso gia fermo", Color3.fromRGB(255, 200, 120))
-		return
-	end
+	log(string.format("[SAVE] pet=%d | test=Claim spam x%d + Delete/Equip", #pets, SPAM_COUNT))
 	setStatus("Cerco i remote")
 	local remotes, blocked = scanNetwork(library, true)
-	log("[REMOTE] Mutazioni accettate + storm cross. Nessuna azione in gioco.")
+	log("[REMOTE] Claim/Redeem + Delete. No trade/save.")
 	if not running then
 		return
 	end
@@ -1160,95 +1211,70 @@ local function run()
 		return
 	end
 
-	-- Pass 1: per-machine dual race with valid same-id sets, only hold if server accepts.
-	for _, plan in ipairs(plans) do
+	local giftIndex, giftWhy, giftTime, redeemed = pickFreeGiftIndex(library)
+	log(string.format(
+		"[PLAN] Redeem Free Gift index=%d why=%s FreeGiftsTime=%s redeemed=%d | NO client nonce/token",
+		giftIndex,
+		tostring(giftWhy),
+		tostring(giftTime),
+		type(redeemed) == "table" and #redeemed or 0
+	))
+
+	local dupeHits = {}
+
+	local redeemTargets = {
+		{ name = "Redeem Free Gift", args = { giftIndex }, note = "solo indice gift, zero token" },
+		{ name = "Redeem Rank Rewards", args = {}, note = "zero args, zero token" },
+		{ name = "Redeem VIP Rewards", args = {}, note = "zero args, zero token" },
+		{ name = "Claim Season Reward", args = {}, note = "zero args, zero token" },
+		{ name = "ClaimLeaveBonus", args = {}, note = "zero args, zero token" },
+		{ name = "Redeem Pet Collection", args = {}, note = "zero args, zero token" },
+	}
+
+	for _, target in ipairs(redeemTargets) do
 		if not running then
 			return
 		end
-		if plan.kind == "cross" or not plan.setA then
+		if blocked[target.name] then
+			log("[REMOTE] " .. target.name .. " ambiguo, salto")
 			continue
 		end
-		if blocked[plan.name] then
-			log("[REMOTE] " .. plan.name .. " ambiguo, salto")
-			continue
-		end
-		local aligned, alignWhy = waitNearSaveTick(library)
-		if not running or alignWhy == "stop" then
-			return
-		end
-		if not aligned and alignWhy == "missing" then
-			log("[INFO] Allineamento fallito")
-			continue
-		end
-		log(string.format("[TEST] Dual race %s | mode=%s | gap=%s", plan.name, plan.mode, tostring(RACE_GAP)))
-		setStatus("Race " .. plan.name)
-		local hits, method, accepted = sendDualRace(library, remotes, plan.name, plan.setA, plan.setB)
-		if not running then
-			return
-		end
+		log(string.format("[TEST] Spam x%d | %s | %s | args=%s", SPAM_COUNT, target.name, target.note, #target.args == 0 and "(none)" or tostring(target.args[1])))
+		setStatus("Spam " .. target.name)
+		local hits, method, trueCount = spamSamePayload(library, remotes, target.name, target.args, SPAM_COUNT)
 		log(string.format(
-			"[NET] %s | hits=%d via %s | accepted=%s",
-			plan.name,
+			"[NET] %s | hits=%d via %s | trueCount=%d/%d",
+			target.name,
 			hits,
 			method or "Network",
-			tostring(accepted)
+			trueCount,
+			SPAM_COUNT
 		))
-		if hits < 1 then
-			log("[SYNC] Skip hold: pacchetto non uscito")
-			continue
+		if trueCount >= 2 then
+			log(string.format("[DUPE?] %s ha risposto true %d volte sullo stesso payload", target.name, trueCount))
+			dupeHits[#dupeHits + 1] = target.name
 		end
-		if not accepted then
-			log("[SYNC] Skip hold: server ha rifiutato entrambi (nessuna mutazione save)")
-			continue
-		end
-		log("[SYNC] Hold duale dopo mutazione accettata su " .. plan.name)
-		local frozen = holdDual(library)
-		if not running then
-			return
-		end
-		if frozen then
-			log(string.format("[SAVE FROZEN] Race su mutazione accettata: %s", plan.name))
-			setStatus("SAVE FROZEN", Color3.fromRGB(255, 90, 90))
-			setStroke(Color3.fromRGB(210, 50, 50))
-			return
-		end
+		task.wait(0.15)
 	end
 
-	-- Pass 2: cross-remote storm near save tick.
-	log("[TEST] Cross-remote storm su tutti i piani validi vicino al write")
-	setStatus("Cross storm")
-	local aligned, alignWhy = waitNearSaveTick(library)
-	if not running or alignWhy == "stop" then
+	if not running then
 		return
 	end
-	if aligned or alignWhy == "no_tick" then
-		local hits, method, accepted = sendCrossStorm(library, remotes, plans)
-		log(string.format(
-			"[NET] storm | hits=%d via %s | accepted=%d",
-			hits,
-			method or "Network",
-			accepted
-		))
-		if hits >= 1 then
-			log("[SYNC] Hold duale dopo cross storm")
-			local frozen = holdDual(library)
-			if not running then
-				return
-			end
-			if frozen then
-				log("[SAVE FROZEN] Cross-remote storm ha fermato il save")
-				setStatus("SAVE FROZEN", Color3.fromRGB(255, 90, 90))
-				setStroke(Color3.fromRGB(210, 50, 50))
-				return
-			end
-		else
-			log("[NET] storm | nessun invio")
-		end
+	setStatus("Delete+Equip")
+	local desync = runDeleteEquipDesync(library, remotes)
+	if desync then
+		dupeHits[#dupeHits + 1] = "Delete+Equip"
 	end
 
-	log("[SYNC] Nessuna mutazione accettata ha fermato LastSaveTimestamp e SaveVersion per 3 cicli.")
-	setStatus("Save vivo", Color3.fromRGB(120, 220, 140))
-	setStroke(Color3.fromRGB(40, 150, 80))
+	if #dupeHits > 0 then
+		log("[RESULT] Possibile falla: " .. table.concat(dupeHits, ", "))
+		setStatus("DUPE?", Color3.fromRGB(255, 90, 90))
+		setStroke(Color3.fromRGB(210, 50, 50))
+	else
+		log("[RESULT] Nessun redeem ha dato true>1; Delete/Equip senza desync evidente.")
+		setStatus("Nessun dupe", Color3.fromRGB(120, 220, 140))
+		setStroke(Color3.fromRGB(40, 150, 80))
+	end
 end
 
 local function setRunning(state)
@@ -1475,5 +1501,5 @@ logBox.FocusLost:Connect(function()
 	scrollLogsToBottom()
 end)
 
-log("[GUI] Solo START. Set validi + storm sul tick save. Trascina dal titolo.")
-log("[GUI] Scroll sui log. Polso: LastSaveTimestamp + SaveVersion. Guarda [RET]/")
+log("[GUI] Solo START. Claim/Redeem spam x5 + Delete/Equip. Guarda [RET].")
+log("[GUI] trueCount>=2 = possibile dupe. Trade/save non toccati.")
