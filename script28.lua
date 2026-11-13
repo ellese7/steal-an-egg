@@ -1,6 +1,6 @@
--- Delta only. Claim/Redeem spam + Delete/Equip desync probe for psx-stayso.
--- No trade, no save-freeze. No booth/mail/daycare.
--- Verdict: same redeem payload returns true more than once = reward dupe.
+-- Delta only. Dual-store / atomicity probe: BoosterPet_Claim, Redeem Dark Matter Pet,
+-- Quests: Redeem Reward. No trade, no save-freeze, no booth/mail/daycare.
+-- Verdict: trueCount>=2 on same payload, or claim+state-change both true with inconsistent save.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -13,15 +13,11 @@ local SPAM_COUNT = 5
 local MAX_LINES = 600
 
 local COMMANDS = {
-	{ name = "Redeem Free Gift", kind = "invoke" },
-	{ name = "Redeem Rank Rewards", kind = "invoke" },
-	{ name = "Redeem VIP Rewards", kind = "invoke" },
-	{ name = "Claim Season Reward", kind = "invoke" },
-	{ name = "ClaimLeaveBonus", kind = "invoke" },
+	{ name = "BoosterPet_Claim", kind = "invoke" },
+	{ name = "Redeem Dark Matter Pet", kind = "invoke" },
 	{ name = "Quests: Redeem Reward", kind = "invoke" },
-	{ name = "Redeem Pet Collection", kind = "invoke" },
-	{ name = "Delete Several Pets", kind = "invoke" },
 	{ name = "Equip Pet", kind = "invoke" },
+	{ name = "HasExclusiveAccess", kind = "invoke" },
 }
 
 local root = _G
@@ -1111,15 +1107,118 @@ local function spamSamePayload(library, remotes, name, args, count)
 	return hits, method, trueCount
 end
 
-local function runDeleteEquipDesync(library, remotes)
-	local uid, petId = pickDeleteTarget(library)
-	if not uid then
-		log("[INFO] Delete/Equip: nessun pet disponibile")
-		return false
+local function countPets(library)
+	return #collectPets(library)
+end
+
+local function countQueue(library)
+	local save = currentSave(library)
+	if type(save) ~= "table" or type(save.DarkMatterQueue) ~= "table" then
+		return 0
 	end
-	log(string.format("[TEST] Delete+Equip stesso frame | uid=%s id=%s", uid, tostring(petId)))
-	local before = petStillInSave(library, uid)
-	log(string.format("[SAVE] pre: pet in save=%s", tostring(before)))
+	local n = 0
+	for _ in pairs(save.DarkMatterQueue) do
+		n += 1
+	end
+	return n
+end
+
+local function pickDarkMatterSlot(library)
+	local save = currentSave(library)
+	if type(save) ~= "table" or type(save.DarkMatterQueue) ~= "table" then
+		return nil, nil, "no_queue"
+	end
+	local now = os.time()
+	pcall(function()
+		if type(library.Network.Invoke) == "function" then
+			local t = library.Network.Invoke("Get OSTime")
+			if type(t) == "number" then
+				now = t
+			end
+		end
+	end)
+	local anySlot, anyEntry = nil, nil
+	local readySlot, readyEntry = nil, nil
+	for slot, entry in pairs(save.DarkMatterQueue) do
+		if type(entry) == "table" then
+			anySlot, anyEntry = tostring(slot), entry
+			local readyTime = tonumber(entry.readyTime) or 0
+			if readyTime <= now + 1 then
+				readySlot, readyEntry = tostring(slot), entry
+				break
+			end
+		end
+	end
+	if readySlot then
+		return readySlot, readyEntry, "ready"
+	end
+	if anySlot then
+		return anySlot, anyEntry, "not_ready"
+	end
+	return nil, nil, "empty"
+end
+
+local function pickBoosterPetId(library)
+	local pets = collectPets(library)
+	for _, pet in ipairs(pets) do
+		if type(pet.id) == "string" and #pet.id > 0 then
+			return pet.id, "from_inventory"
+		end
+	end
+	if type(library.Directory) == "table" and type(library.Directory.Pets) == "table" then
+		for id, def in pairs(library.Directory.Pets) do
+			if type(def) == "table" and def.rarity ~= "Exclusive" and not def.isGift and not def.isPremium then
+				return tostring(id), "from_directory"
+			end
+		end
+	end
+	return "1", "fallback"
+end
+
+local function pickQuestReward(library)
+	local save = currentSave(library)
+	local points = save and tonumber(save["Quest Points"]) or 0
+	local purchased = save and save.QuestRewards or {}
+	local dir = nil
+	if type(library.Directory) == "table" then
+		dir = library.Directory.QuestRewards
+	end
+	if type(dir) ~= "table" then
+		return nil, points, "no_directory"
+	end
+	local bestName, bestCost = nil, nil
+	for name, reward in pairs(dir) do
+		if type(reward) == "table" and type(reward.Cost) == "number" then
+			local stock = reward.Stock
+			local bought = purchased[name]
+			local used = type(bought) == "table" and tonumber(bought.Purchased) or 0
+			if stock and used >= stock then
+				continue
+			end
+			if points >= reward.Cost then
+				if not bestCost or reward.Cost < bestCost then
+					bestName = name
+					bestCost = reward.Cost
+				end
+			end
+		end
+	end
+	if bestName then
+		return bestName, points, "affordable"
+	end
+	-- cheapest overall for probe even if underfunded
+	for name, reward in pairs(dir) do
+		if type(reward) == "table" and type(reward.Cost) == "number" then
+			if not bestCost or reward.Cost < bestCost then
+				bestName = name
+				bestCost = reward.Cost
+			end
+		end
+	end
+	return bestName, points, bestName and "underfunded" or "none"
+end
+
+local function sameFrameDual(library, remotes, labelA, nameA, argsA, labelB, nameB, argsB)
 	bucket.hits = 0
 	bucket.foreign = 0
 	bucket.expect = nil
@@ -1129,59 +1228,43 @@ local function runDeleteEquipDesync(library, remotes)
 	bucket.loose = true
 	bucket.method = nil
 	bucket.armed = true
-	local delRet, eqRet = nil, nil
+	local retA, retB = nil, nil
 	local pending = 2
 	task.spawn(function()
-		local ok, a, b = pcall(invokeNamedArgs, library, remotes, "Delete Several Pets", { uid })
-		delRet = ok and { a, b } or { false, a }
+		local packed = argsA or {}
+		local ok, a, b = pcall(function()
+			return invokeNamedArgs(library, remotes, nameA, table.unpack(packed, 1, #packed))
+		end)
+		retA = ok and { a, b } or { false, a }
 		pending -= 1
 	end)
 	task.spawn(function()
-		local ok, a, b = pcall(invokeNamedArgs, library, remotes, "Equip Pet", uid)
-		eqRet = ok and { a, b } or { false, a }
+		local packed = argsB or {}
+		local ok, a, b = pcall(function()
+			return invokeNamedArgs(library, remotes, nameB, table.unpack(packed, 1, #packed))
+		end)
+		retB = ok and { a, b } or { false, a }
 		pending -= 1
 	end)
-	local deadline = os.clock() + 3
+	local deadline = os.clock() + 4
 	while running and pending > 0 and os.clock() < deadline do
 		task.wait(0.05)
 	end
-	task.wait(0.2)
+	task.wait(0.1)
 	bucket.armed = false
 	bucket.loose = false
 	bucket.expectAny = false
-	if delRet then
-		log(string.format("[RET] Delete Several Pets -> %s | %s", tostring(delRet[1]), tostring(delRet[2])))
+	if retA then
+		log(string.format("[RET] %s -> %s | %s", labelA, tostring(retA[1]), tostring(retA[2])))
 	else
-		log("[RET] Delete Several Pets -> (timeout)")
+		log(string.format("[RET] %s -> (timeout)", labelA))
 	end
-	if eqRet then
-		log(string.format("[RET] Equip Pet -> %s | %s", tostring(eqRet[1]), tostring(eqRet[2])))
+	if retB then
+		log(string.format("[RET] %s -> %s | %s", labelB, tostring(retB[1]), tostring(retB[2])))
 	else
-		log("[RET] Equip Pet -> (timeout)")
+		log(string.format("[RET] %s -> (timeout)", labelB))
 	end
-	task.wait(0.5)
-	local after, equipped = petStillInSave(library, uid)
-	log(string.format(
-		"[SAVE] post: pet in save=%s equipped=%s | deleteOk=%s equipOk=%s",
-		tostring(after),
-		tostring(equipped),
-		tostring(delRet and delRet[1]),
-		tostring(eqRet and eqRet[1])
-	))
-	-- Desync signal: delete true but pet still present, or equip true after delete true.
-	if delRet and delRet[1] == true and after then
-		log("[DESYNC] Delete true ma pet ancora in save")
-		return true
-	end
-	if delRet and delRet[1] == true and eqRet and eqRet[1] == true then
-		log("[DESYNC] Delete e Equip entrambi true sullo stesso uid")
-		return true
-	end
-	if delRet and delRet[1] == true and not after and eqRet and eqRet[1] == true then
-		log("[DESYNC?] Equip true dopo delete (pet assente in save locale)")
-		return true
-	end
-	return false
+	return retA, retB
 end
 
 local function run()
@@ -1198,11 +1281,20 @@ local function run()
 		setStatus("Save assente", Color3.fromRGB(255, 160, 120))
 		return
 	end
-	local pets = collectPets(library)
-	log(string.format("[SAVE] pet=%d | test=Claim spam x%d + Delete/Equip", #pets, SPAM_COUNT))
+	local petsBefore = countPets(library)
+	local queueBefore = countQueue(library)
+	local save = currentSave(library)
+	local pointsBefore = save and tonumber(save["Quest Points"]) or 0
+	log(string.format(
+		"[SAVE] pet=%d queueDM=%d questPoints=%s | dual-store atomicity probe",
+		petsBefore,
+		queueBefore,
+		tostring(pointsBefore)
+	))
+	log("[ANALISI] Server bytecode assente: lock/task.wait non osservabili. Probe su superficie client + doppio store.")
 	setStatus("Cerco i remote")
 	local remotes, blocked = scanNetwork(library, true)
-	log("[REMOTE] Claim/Redeem + Delete. No trade/save.")
+	log("[REMOTE] BoosterPet_Claim / Redeem Dark Matter / Quests Redeem. No trade/save.")
 	if not running then
 		return
 	end
@@ -1211,67 +1303,244 @@ local function run()
 		return
 	end
 
-	local giftIndex, giftWhy, giftTime, redeemed = pickFreeGiftIndex(library)
-	log(string.format(
-		"[PLAN] Redeem Free Gift index=%d why=%s FreeGiftsTime=%s redeemed=%d | NO client nonce/token",
-		giftIndex,
-		tostring(giftWhy),
-		tostring(giftTime),
-		type(redeemed) == "table" and #redeemed or 0
-	))
-
 	local dupeHits = {}
 
-	local redeemTargets = {
-		{ name = "Redeem Free Gift", args = { giftIndex }, note = "solo indice gift, zero token" },
-		{ name = "Redeem Rank Rewards", args = {}, note = "zero args, zero token" },
-		{ name = "Redeem VIP Rewards", args = {}, note = "zero args, zero token" },
-		{ name = "Claim Season Reward", args = {}, note = "zero args, zero token" },
-		{ name = "ClaimLeaveBonus", args = {}, note = "zero args, zero token" },
-		{ name = "Redeem Pet Collection", args = {}, note = "zero args, zero token" },
-	}
-
-	for _, target in ipairs(redeemTargets) do
-		if not running then
-			return
-		end
-		if blocked[target.name] then
-			log("[REMOTE] " .. target.name .. " ambiguo, salto")
-			continue
-		end
-		log(string.format("[TEST] Spam x%d | %s | %s | args=%s", SPAM_COUNT, target.name, target.note, #target.args == 0 and "(none)" or tostring(target.args[1])))
-		setStatus("Spam " .. target.name)
-		local hits, method, trueCount = spamSamePayload(library, remotes, target.name, target.args, SPAM_COUNT)
+	-- ========== 1) Redeem Dark Matter Pet (dual store: DarkMatterQueue -> Pets) ==========
+	local slot, entry, slotWhy = pickDarkMatterSlot(library)
+	log(string.format(
+		"[PLAN] DarkMatter slot=%s why=%s petId=%s readyTime=%s | stores=DarkMatterQueue+Pets | NO nonce",
+		tostring(slot),
+		tostring(slotWhy),
+		tostring(entry and entry.petId),
+		tostring(entry and entry.readyTime)
+	))
+	if slot and not blocked["Redeem Dark Matter Pet"] then
+		setStatus("DM spam")
+		log(string.format("[TEST] Spam x%d Redeem Dark Matter Pet slot=%s (atomicita' queue->Pets)", SPAM_COUNT, slot))
+		local pets0 = countPets(library)
+		local q0 = countQueue(library)
+		local hits, method, trueCount = spamSamePayload(library, remotes, "Redeem Dark Matter Pet", { slot }, SPAM_COUNT)
+		task.wait(0.4)
+		bindSave(library)
+		local pets1 = countPets(library)
+		local q1 = countQueue(library)
 		log(string.format(
-			"[NET] %s | hits=%d via %s | trueCount=%d/%d",
-			target.name,
+			"[NET] Redeem Dark Matter Pet | hits=%d via %s | trueCount=%d/%d | pets %d->%d | queue %d->%d",
 			hits,
 			method or "Network",
 			trueCount,
-			SPAM_COUNT
+			SPAM_COUNT,
+			pets0,
+			pets1,
+			q0,
+			q1
 		))
 		if trueCount >= 2 then
-			log(string.format("[DUPE?] %s ha risposto true %d volte sullo stesso payload", target.name, trueCount))
-			dupeHits[#dupeHits + 1] = target.name
+			log("[DUPE?] Redeem Dark Matter Pet true>1 sullo stesso slot")
+			dupeHits[#dupeHits + 1] = "DM-spam"
 		end
-		task.wait(0.15)
+		if trueCount >= 1 and pets1 - pets0 > 1 then
+			log("[DUPE?] pets cresciuti piu' dei trueCount redeem")
+			dupeHits[#dupeHits + 1] = "DM-pets-delta"
+		end
+		if trueCount >= 1 and q1 == q0 then
+			log("[DESYNC?] redeem true ma DarkMatterQueue invariata")
+			dupeHits[#dupeHits + 1] = "DM-queue-stuck"
+		end
+
+		-- Same-frame: Redeem + Equip(slot) — slot key often equals source uid
+		if slotWhy == "ready" or slotWhy == "not_ready" then
+			-- Re-pick if first spam consumed the slot
+			local slot2, _, why2 = pickDarkMatterSlot(library)
+			if slot2 then
+				log(string.format("[TEST] Stesso frame: Redeem Dark Matter + Equip Pet | slot=%s why=%s", slot2, tostring(why2)))
+				setStatus("DM+Equip")
+				local a, b = sameFrameDual(
+					library,
+					remotes,
+					"Redeem Dark Matter Pet",
+					"Redeem Dark Matter Pet",
+					{ slot2 },
+					"Equip Pet",
+					"Equip Pet",
+					{ slot2 }
+				)
+				task.wait(0.4)
+				bindSave(library)
+				local stillQueued = false
+				local s = currentSave(library)
+				if type(s) == "table" and type(s.DarkMatterQueue) == "table" then
+					stillQueued = s.DarkMatterQueue[slot2] ~= nil or s.DarkMatterQueue[tonumber(slot2)] ~= nil
+				end
+				local inPets, equipped = petStillInSave(library, slot2)
+				log(string.format(
+					"[SAVE] post DM+Equip | queued=%s inPets=%s equipped=%s",
+					tostring(stillQueued),
+					tostring(inPets),
+					tostring(equipped)
+				))
+				if a and a[1] == true and b and b[1] == true then
+					log("[DESYNC?] Redeem e Equip entrambi true sullo stesso slot/uid")
+					dupeHits[#dupeHits + 1] = "DM+Equip"
+				end
+				if a and a[1] == true and stillQueued and inPets then
+					log("[DESYNC] pet sia in queue che in Pets")
+					dupeHits[#dupeHits + 1] = "DM-dual-presence"
+				end
+			else
+				log("[INFO] Nessuno slot DM rimasto per test Redeem+Equip")
+			end
+		end
+	else
+		log("[INFO] Dark Matter: coda vuota o remote bloccato — metti un pet in coda e riprova per il vettore forte")
 	end
 
 	if not running then
 		return
 	end
-	setStatus("Delete+Equip")
-	local desync = runDeleteEquipDesync(library, remotes)
-	if desync then
-		dupeHits[#dupeHits + 1] = "Delete+Equip"
+
+	-- ========== 2) BoosterPet_Claim (id+variant, no nonce; entitlement + Pets) ==========
+	local boosterId, boosterWhy = pickBoosterPetId(library)
+	log(string.format(
+		"[PLAN] BoosterPet_Claim id=%s variant=Normal why=%s | stores=entitlement?+Pets | NO nonce | lock client=flag UI only",
+		tostring(boosterId),
+		tostring(boosterWhy)
+	))
+	if not blocked["BoosterPet_Claim"] then
+		setStatus("Booster spam")
+		local pets0 = countPets(library)
+		log(string.format("[TEST] Spam x%d BoosterPet_Claim(%s, Normal)", SPAM_COUNT, tostring(boosterId)))
+		local hits, method, trueCount = spamSamePayload(
+			library,
+			remotes,
+			"BoosterPet_Claim",
+			{ boosterId, "Normal" },
+			SPAM_COUNT
+		)
+		task.wait(0.4)
+		bindSave(library)
+		local pets1 = countPets(library)
+		log(string.format(
+			"[NET] BoosterPet_Claim | hits=%d via %s | trueCount=%d/%d | pets %d->%d",
+			hits,
+			method or "Network",
+			trueCount,
+			SPAM_COUNT,
+			pets0,
+			pets1
+		))
+		if trueCount >= 2 then
+			log("[DUPE?] BoosterPet_Claim true>1")
+			dupeHits[#dupeHits + 1] = "Booster-spam"
+		end
+		if trueCount >= 1 and pets1 - pets0 > trueCount then
+			log("[DUPE?] pets delta > trueCount booster")
+			dupeHits[#dupeHits + 1] = "Booster-pets-delta"
+		end
+
+		-- Same-frame: Claim + second Claim (state change = consuming entitlement twice)
+		log("[TEST] Stesso frame: BoosterPet_Claim x2 (Normal + Golden se possibile)")
+		setStatus("Booster dual")
+		sameFrameDual(
+			library,
+			remotes,
+			"BoosterPet_Claim Normal",
+			"BoosterPet_Claim",
+			{ boosterId, "Normal" },
+			"BoosterPet_Claim Golden",
+			"BoosterPet_Claim",
+			{ boosterId, "Golden" }
+		)
+	else
+		log("[REMOTE] BoosterPet_Claim ambiguo, salto")
+	end
+
+	if not running then
+		return
+	end
+
+	-- ========== 3) Quests: Redeem Reward (Quest Points + QuestRewards + grant) ==========
+	local rewardName, points, rewardWhy = pickQuestReward(library)
+	log(string.format(
+		"[PLAN] Quests: Redeem Reward name=%s points=%s why=%s | stores=QuestPoints+QuestRewards+grant | NO nonce",
+		tostring(rewardName),
+		tostring(points),
+		tostring(rewardWhy)
+	))
+	if rewardName and not blocked["Quests: Redeem Reward"] then
+		setStatus("Quest spam")
+		local points0 = points
+		local pets0 = countPets(library)
+		log(string.format("[TEST] Spam x%d Quests: Redeem Reward '%s'", SPAM_COUNT, rewardName))
+		local hits, method, trueCount = spamSamePayload(
+			library,
+			remotes,
+			"Quests: Redeem Reward",
+			{ rewardName },
+			SPAM_COUNT
+		)
+		task.wait(0.4)
+		bindSave(library)
+		local s = currentSave(library)
+		local points1 = s and tonumber(s["Quest Points"]) or points0
+		local pets1 = countPets(library)
+		local purchased = s and s.QuestRewards and s.QuestRewards[rewardName]
+		local purchasedN = type(purchased) == "table" and tonumber(purchased.Purchased) or 0
+		log(string.format(
+			"[NET] Quests: Redeem Reward | hits=%d via %s | trueCount=%d/%d | points %s->%s | pets %d->%d | Purchased=%s",
+			hits,
+			method or "Network",
+			trueCount,
+			SPAM_COUNT,
+			tostring(points0),
+			tostring(points1),
+			pets0,
+			pets1,
+			tostring(purchasedN)
+		))
+		if trueCount >= 2 then
+			log("[DUPE?] Quests: Redeem Reward true>1 sullo stesso reward")
+			dupeHits[#dupeHits + 1] = "Quest-spam"
+		end
+		if trueCount >= 1 and points0 - points1 > 0 then
+			-- expected single deduction; if deducted Cost*trueCount with trueCount>1 already flagged
+			local dir = library.Directory and library.Directory.QuestRewards and library.Directory.QuestRewards[rewardName]
+			local cost = dir and tonumber(dir.Cost) or 0
+			if cost > 0 and (points0 - points1) >= cost * 2 then
+				log("[DUPE?] Quest Points scalati >= 2x Cost")
+				dupeHits[#dupeHits + 1] = "Quest-points-double"
+			end
+		end
+
+		-- Same-frame: redeem same reward twice explicitly
+		if rewardWhy == "affordable" then
+			log("[TEST] Stesso frame: Quests Redeem x2 stesso reward (check-then-act su Points/Stock)")
+			setStatus("Quest dual")
+			local a, b = sameFrameDual(
+				library,
+				remotes,
+				"Quest Redeem A",
+				"Quests: Redeem Reward",
+				{ rewardName },
+				"Quest Redeem B",
+				"Quests: Redeem Reward",
+				{ rewardName }
+			)
+			if a and a[1] == true and b and b[1] == true then
+				log("[DUPE?] entrambi i Redeem Quest true nello stesso frame")
+				dupeHits[#dupeHits + 1] = "Quest-same-frame"
+			end
+		end
+	else
+		log("[INFO] Quest reward non selezionabile o remote bloccato")
 	end
 
 	if #dupeHits > 0 then
-		log("[RESULT] Possibile falla: " .. table.concat(dupeHits, ", "))
+		log("[RESULT] Possibile finestra: " .. table.concat(dupeHits, ", "))
 		setStatus("DUPE?", Color3.fromRGB(255, 90, 90))
 		setStroke(Color3.fromRGB(210, 50, 50))
 	else
-		log("[RESULT] Nessun redeem ha dato true>1; Delete/Equip senza desync evidente.")
+		log("[RESULT] Nessuna finestra sfruttabile osservata su questi tre vettori (o precondizioni assenti: coda DM / booster / punti).")
 		setStatus("Nessun dupe", Color3.fromRGB(120, 220, 140))
 		setStroke(Color3.fromRGB(40, 150, 80))
 	end
@@ -1501,5 +1770,5 @@ logBox.FocusLost:Connect(function()
 	scrollLogsToBottom()
 end)
 
-log("[GUI] Solo START. Claim/Redeem spam x5 + Delete/Equip. Guarda [RET].")
-log("[GUI] trueCount>=2 = possibile dupe. Trade/save non toccati.")
+log("[GUI] Solo START. Dual-store: Booster / DarkMatter / Quest. Guarda [RET].")
+log("[GUI] trueCount>=2 o DESYNC = finestra. No trade/save.")
