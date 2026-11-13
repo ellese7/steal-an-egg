@@ -27,7 +27,6 @@ local CHECKS = 3
 local WATCH_SECONDS = 6
 local SAMPLE_STEP = 1
 local HOLD_STEP = 4
-local LEARN_SECONDS = 20
 local MAX_LINES = 600
 
 local root = _G
@@ -676,40 +675,6 @@ local function scanNetwork(library, quiet)
 	return found, blocked
 end
 
-local function learnFromPlay(library, found, blocked)
-	local names = commandNames()
-	local pending = false
-	for _, name in ipairs(names) do
-		if not found[name] and not blocked[name] then
-			pending = true
-		end
-	end
-	if not pending then
-		return
-	end
-	log("[REMOTE] Cache incompleta. Hai 20s: apri gift/macchine/orbs in gioco se puoi, altrimenti uso Network diretto.")
-	local deadline = os.clock() + LEARN_SECONDS
-	while running and pending and os.clock() < deadline do
-		setStatus("Usa gift/macchina in gioco")
-		task.wait(0.5)
-		local seen, seenBlocked = scanNetwork(library, true)
-		pending = false
-		for _, name in ipairs(names) do
-			if blocked[name] or seenBlocked[name] then
-				if seenBlocked[name] and not blocked[name] then
-					blocked[name] = true
-					log("[REMOTE] " .. name .. " ambiguo")
-				end
-			elseif seen[name] and not found[name] then
-				found[name] = seen[name]
-				log(string.format("[REMOTE] %s imparato id %s (%s)", name, debugId(seen[name]), seen[name].ClassName))
-			elseif not found[name] then
-				pending = true
-			end
-		end
-	end
-end
-
 local function argsEqual(expectArgs, ...)
 	local n = select("#", ...)
 	if n ~= #expectArgs then
@@ -890,8 +855,8 @@ local function run()
 		log("[CLOCK] Nota: un campo del polso duale non si e mosso in baseline. Serve che entrambi restino fermi dopo il payload.")
 	end
 	setStatus("Cerco i remote")
-	local remotes, blocked = scanNetwork(library, false)
-	learnFromPlay(library, remotes, blocked)
+	local remotes, blocked = scanNetwork(library, true)
+	log("[REMOTE] Invio automatico via Network. Nessuna azione in gioco richiesta.")
 	if not running then
 		return
 	end
@@ -1042,105 +1007,114 @@ gui.DisplayOrder = 1006
 gui.Parent = parentGui
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromScale(0.94, 0.7)
-frame.Position = UDim2.fromScale(0.03, 0.03)
+frame.Size = UDim2.fromOffset(300, 260)
+frame.Position = UDim2.new(1, -312, 0, 12)
 frame.BackgroundColor3 = Color3.fromRGB(12, 14, 20)
 frame.Active = true
 frame.Parent = gui
 
 local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(0, 10)
+corner.CornerRadius = UDim.new(0, 8)
 corner.Parent = frame
 
 frameStroke = Instance.new("UIStroke")
-frameStroke.Thickness = 2
+frameStroke.Thickness = 1.5
 frameStroke.Color = Color3.fromRGB(70, 110, 170)
 frameStroke.Parent = frame
 
 local title = Instance.new("TextLabel")
 title.BackgroundTransparency = 1
-title.Position = UDim2.fromOffset(12, 8)
-title.Size = UDim2.new(1, -24, 0, 22)
+title.Position = UDim2.fromOffset(8, 4)
+title.Size = UDim2.new(1, -16, 0, 16)
 title.Font = Enum.Font.GothamBold
-title.TextSize = 16
+title.TextSize = 12
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = Color3.fromRGB(236, 240, 248)
-title.Text = "SAVE FREEZE TIER A/B"
+title.Text = "SAVE FREEZE"
 title.Parent = frame
 
 startBtn = Instance.new("TextButton")
-startBtn.Size = UDim2.fromOffset(96, 34)
-startBtn.Position = UDim2.fromOffset(12, 36)
+startBtn.Size = UDim2.fromOffset(64, 26)
+startBtn.Position = UDim2.fromOffset(8, 24)
 startBtn.BackgroundColor3 = Color3.fromRGB(32, 130, 78)
 startBtn.Text = "START"
 startBtn.TextColor3 = Color3.new(1, 1, 1)
 startBtn.Font = Enum.Font.GothamBold
-startBtn.TextSize = 14
+startBtn.TextSize = 12
 startBtn.AutoButtonColor = true
 startBtn.Parent = frame
 
 local startCorner = Instance.new("UICorner")
-startCorner.CornerRadius = UDim.new(0, 7)
+startCorner.CornerRadius = UDim.new(0, 6)
 startCorner.Parent = startBtn
 
 copyBtn = Instance.new("TextButton")
-copyBtn.Size = UDim2.fromOffset(118, 34)
-copyBtn.Position = UDim2.fromOffset(116, 36)
+copyBtn.Size = UDim2.fromOffset(78, 26)
+copyBtn.Position = UDim2.fromOffset(78, 24)
 copyBtn.BackgroundColor3 = Color3.fromRGB(36, 92, 158)
-copyBtn.Text = "COPIA LOG"
+copyBtn.Text = "COPIA"
 copyBtn.TextColor3 = Color3.new(1, 1, 1)
 copyBtn.Font = Enum.Font.GothamBold
-copyBtn.TextSize = 13
+copyBtn.TextSize = 11
 copyBtn.AutoButtonColor = true
 copyBtn.Parent = frame
 
 local copyCorner = Instance.new("UICorner")
-copyCorner.CornerRadius = UDim.new(0, 7)
+copyCorner.CornerRadius = UDim.new(0, 6)
 copyCorner.Parent = copyBtn
 
 statusLabel = Instance.new("TextLabel")
-statusLabel.Size = UDim2.new(1, -250, 0, 34)
-statusLabel.Position = UDim2.fromOffset(244, 36)
+statusLabel.Size = UDim2.new(1, -168, 0, 26)
+statusLabel.Position = UDim2.fromOffset(162, 24)
 statusLabel.BackgroundTransparency = 1
 statusLabel.Text = "Pronto"
 statusLabel.TextColor3 = Color3.fromRGB(220, 228, 240)
 statusLabel.Font = Enum.Font.GothamBold
-statusLabel.TextSize = 14
+statusLabel.TextSize = 11
 statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
 statusLabel.Parent = frame
 
 logBox = Instance.new("TextBox")
 logBox.Name = "LogText"
-logBox.Position = UDim2.fromOffset(12, 80)
-logBox.Size = UDim2.new(1, -24, 1, -92)
+logBox.Position = UDim2.fromOffset(8, 56)
+logBox.Size = UDim2.new(1, -16, 1, -64)
 logBox.BackgroundColor3 = Color3.fromRGB(7, 9, 14)
 logBox.TextColor3 = Color3.fromRGB(226, 232, 240)
 logBox.Font = Enum.Font.Code
-logBox.TextSize = 14
+logBox.TextSize = 11
 logBox.TextXAlignment = Enum.TextXAlignment.Left
 logBox.TextYAlignment = Enum.TextYAlignment.Top
 logBox.TextWrapped = true
 logBox.ClearTextOnFocus = false
-logBox.TextEditable = false
+logBox.TextEditable = true
 logBox.MultiLine = true
 logBox.Active = true
+logBox.Selectable = true
 logBox.Text = ""
 logBox.Parent = frame
 
 local logCorner = Instance.new("UICorner")
-logCorner.CornerRadius = UDim.new(0, 8)
+logCorner.CornerRadius = UDim.new(0, 6)
 logCorner.Parent = logBox
 
 startBtn.MouseButton1Click:Connect(function()
 	setRunning(not running)
 end)
 copyBtn.MouseButton1Click:Connect(copyLogs)
+logBox.Focused:Connect(function()
+	-- Keep current log selectable; do not clear.
+	pcall(function()
+		logBox.Text = table.concat(lines, "\n")
+		logBox.CursorPosition = #logBox.Text + 1
+		logBox.SelectionStart = 1
+	end)
+end)
 logBox.FocusLost:Connect(function()
 	pcall(function()
 		logBox.Text = table.concat(lines, "\n")
 	end)
 end)
 
-log("[GUI] Pronto. Polso duale LastSaveTimestamp+SaveVersion. Tier A/B filtrata, no booth/mail/daycare.")
-log("[NOTA] Ordine: Open Gift -> macchine -> Pet Positions/Orbs/Lootbag. COPIA LOG o tieni premuto il testo.")
+log("[GUI] Solo START. Nessuna azione in gioco. Tocca il log per selezionare/copiare.")
+log("[GUI] Polso: LastSaveTimestamp + SaveVersion.")
