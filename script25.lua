@@ -1,6 +1,6 @@
--- Delta only. Tier A/B save-freeze probe for psx-stayso.
+-- Delta only. Race-condition probe on valid pet mutations for psx-stayso.
 -- Dual pulse: LastSaveTimestamp + SaveVersion must both stall for 3 cycles.
--- No trade, booth, mail, daycare. No new files; this is the stayso test script.
+-- No trade, booth, mail, daycare. No dirty type payloads.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -9,20 +9,22 @@ if not LocalPlayer then
 	LocalPlayer = Players.PlayerAdded:Wait()
 end
 
--- Priority: Open Gift -> pet machines -> positions/orbs.
-local COMMANDS = {
-	{ name = "Open Gift", kind = "invoke", shape = "gift" },
-	{ name = "Fuse Pets", kind = "invoke", shape = "uids" },
-	{ name = "Use Golden Machine", kind = "invoke", shape = "uids" },
-	{ name = "Use Rainbow Machine", kind = "invoke", shape = "uids" },
-	{ name = "Enchant Pets", kind = "invoke", shape = "enchant" },
-	{ name = "Delete Several Pets", kind = "invoke", shape = "delete" },
-	{ name = "Pet Positions", kind = "fire", shape = "positions" },
-	{ name = "Claim Orbs", kind = "fire", shape = "orbs" },
-	{ name = "Collect Lootbag", kind = "fire", shape = "lootbag" },
+local RACE_COMMANDS = {
+	{ name = "Fuse Pets", kind = "invoke" },
+	{ name = "Use Golden Machine", kind = "invoke" },
+	{ name = "Use Rainbow Machine", kind = "invoke" },
 }
 
-local PAYLOAD_STEPS = { "valid_1_uid", "{0}", "{}", "{nil}", "string" }
+local POSITIONS_COMMAND = { name = "Pet Positions", kind = "fire" }
+
+local COMMANDS = {
+	RACE_COMMANDS[1],
+	RACE_COMMANDS[2],
+	RACE_COMMANDS[3],
+	POSITIONS_COMMAND,
+}
+
+local RACE_GAP = 0.05
 local CHECKS = 3
 local WATCH_SECONDS = 4
 local SAMPLE_STEP = 1
@@ -51,6 +53,7 @@ local bucket = {
 	hits = 0,
 	foreign = 0,
 	expect = nil,
+	expectAny = false,
 	remote = nil,
 	loose = false,
 	capture = nil,
@@ -65,9 +68,23 @@ local statusLabel
 local startBtn
 local copyBtn
 local logBox
+local logScroll
 local frameStroke
 local lines = {}
 local saveCache = nil
+
+local function scrollLogsToBottom()
+	if not logScroll then
+		return
+	end
+	task.defer(function()
+		pcall(function()
+			local canvasY = logScroll.AbsoluteCanvasSize.Y
+			local viewY = logScroll.AbsoluteSize.Y
+			logScroll.CanvasPosition = Vector2.new(0, math.max(0, canvasY - viewY))
+		end)
+	end)
+end
 
 local function paintLogs()
 	if not logBox then
@@ -77,6 +94,7 @@ local function paintLogs()
 	pcall(function()
 		logBox.Text = table.concat(lines, "\n")
 	end)
+	scrollLogsToBottom()
 end
 
 local function log(text)
@@ -276,93 +294,46 @@ local function readDual(library)
 	return nil, nil
 end
 
-local function pickOwnedUid(library)
+local function collectUids(library)
+	local uids = {}
 	local save = currentSave(library)
 	if type(save) ~= "table" or type(save.Pets) ~= "table" then
-		return nil, nil
+		return uids
 	end
 	for _, pet in pairs(save.Pets) do
 		if type(pet) == "table" and type(pet.uid) == "string" and #pet.uid > 0 then
-			return pet.uid, tostring(pet.id)
+			uids[#uids + 1] = pet.uid
 		end
 	end
-	return nil, nil
+	return uids
 end
 
-local function buildPayload(shape, step, uid, petId)
-	if step == "valid_1_uid" then
-		if shape == "delete" then
-			return nil, "skip_valid_delete"
-		end
-		if not uid then
-			return nil, "no_uid"
-		end
-		if shape == "gift" then
-			return { { uid }, petId or tostring(uid), false, false }, nil
-		end
-		if shape == "enchant" then
-			return { { uid }, false }, nil
-		end
-		if shape == "positions" then
-			return { { [uid] = Vector3.new(0, 0, 0) } }, nil
-		end
-		if shape == "orbs" then
-			return { { "orb_probe_1" } }, nil
-		end
-		if shape == "lootbag" then
-			return { "loot_probe_1", Vector3.new(0, 0, 0) }, nil
-		end
-		return { { uid } }, nil
+local function makeUidSets(uids)
+	if #uids >= 4 then
+		return { uids[1], uids[2] }, { uids[3], uids[4] }, "due_set_disgiunti"
 	end
-	if step == "{0}" then
-		if shape == "lootbag" then
-			return { 0, Vector3.new(0, 0, 0) }, nil
-		end
-		if shape == "gift" then
-			return { { 0 }, "0", false, false }, nil
-		end
-		if shape == "enchant" then
-			return { { 0 }, false }, nil
-		end
-		return { { 0 } }, nil
+	if #uids >= 2 then
+		return { uids[1], uids[2] }, { uids[2], uids[1] }, "stessi_uid_ordine_invertito"
 	end
-	if step == "{}" then
-		if shape == "lootbag" then
-			return { {}, Vector3.new(0, 0, 0) }, nil
-		end
-		if shape == "gift" then
-			return { {}, "0", false, false }, nil
-		end
-		if shape == "enchant" then
-			return { {}, false }, nil
-		end
-		return { {} }, nil
+	if #uids == 1 then
+		return { uids[1] }, { uids[1] }, "singolo_uid_ripetuto"
 	end
-	if step == "{nil}" then
-		if shape == "lootbag" then
-			return { nil, Vector3.new(0, 0, 0) }, nil
+	return nil, nil, "nessun_uid"
+end
+
+local function nanInfMap(uids)
+	local map = {}
+	local nan = 0 / 0
+	for i, uid in ipairs(uids) do
+		if i > 4 then
+			break
 		end
-		if shape == "gift" then
-			return { { nil }, "0", false, false }, nil
-		end
-		if shape == "enchant" then
-			return { { nil }, false }, nil
-		end
-		return { { nil } }, nil
+		map[uid] = Vector3.new(nan, math.huge, -math.huge)
 	end
-	if step == "string" then
-		if shape == "lootbag" then
-			return { "invalid_type", Vector3.new(0, 0, 0) }, nil
-		end
-		if shape == "gift" then
-			return { "invalid_type", "0", false, false }, nil
-		end
-		if shape == "enchant" then
-			return { "invalid_type", false }, nil
-		end
-		return { "invalid_type" }, nil
+	if next(map) == nil then
+		map["probe"] = Vector3.new(nan, math.huge, -math.huge)
 	end
-	return nil, "unknown_step"
+	return map
 end
 
 local function observeDualBaseline(library)
@@ -703,25 +674,33 @@ local function namecall(self, ...)
 		method = getnamecallmethod()
 	end
 	local state = root.__DeltaSaveFreeze
-	if state and state.armed and (method == "InvokeServer" or method == "FireServer") and type(state.expect) == "table" and argsEqual(state.expect, ...) then
-		local owned = false
-		if state.remote then
-			owned = self == state.remote
-		elseif state.loose then
-			owned = true
+	if state and state.armed and (method == "InvokeServer" or method == "FireServer") then
+		local matched = false
+		if state.expectAny then
+			matched = true
+		elseif type(state.expect) == "table" then
+			matched = argsEqual(state.expect, ...)
 		end
-		if owned then
-			pcall(function()
-				state.hits = (state.hits or 0) + 1
-				state.method = method
-				if state.loose and state.capture == nil then
-					state.capture = self
-				end
-			end)
-		elseif state.remote then
-			pcall(function()
-				state.foreign = (state.foreign or 0) + 1
-			end)
+		if matched then
+			local owned = false
+			if state.remote then
+				owned = self == state.remote
+			elseif state.loose then
+				owned = true
+			end
+			if owned then
+				pcall(function()
+					state.hits = (state.hits or 0) + 1
+					state.method = method
+					if state.loose and state.capture == nil then
+						state.capture = self
+					end
+				end)
+			elseif state.remote then
+				pcall(function()
+					state.foreign = (state.foreign or 0) + 1
+				end)
+			end
 		end
 	end
 	local fwd = state and state.old
@@ -758,6 +737,7 @@ local function sendArgs(remote, args)
 	bucket.hits = 0
 	bucket.foreign = 0
 	bucket.expect = args
+	bucket.expectAny = false
 	bucket.remote = remote
 	bucket.capture = nil
 	bucket.loose = false
@@ -773,6 +753,7 @@ local function sendArgs(remote, args)
 	bucket.armed = false
 	bucket.remote = nil
 	bucket.expect = nil
+	bucket.expectAny = false
 	return bucket.hits, bucket.foreign, callOk, callErr, bucket.method
 end
 
@@ -780,6 +761,7 @@ local function sendLoose(library, command, args)
 	bucket.hits = 0
 	bucket.foreign = 0
 	bucket.expect = args
+	bucket.expectAny = false
 	bucket.remote = nil
 	bucket.capture = nil
 	bucket.loose = true
@@ -801,10 +783,76 @@ local function sendLoose(library, command, args)
 	bucket.armed = false
 	bucket.loose = false
 	bucket.expect = nil
+	bucket.expectAny = false
 	local capture = bucket.capture
 	local method = bucket.method
 	bucket.capture = nil
 	return bucket.hits, capture, callOk, callErr, method
+end
+
+local function invokeOne(library, command, remote, uidSet)
+	if remote then
+		if classNameOf(remote) == "RemoteFunction" then
+			remote:InvokeServer(uidSet)
+		else
+			remote:FireServer(uidSet)
+		end
+	elseif command.kind == "invoke" then
+		library.Network.Invoke(command.name, uidSet)
+	else
+		library.Network.Fire(command.name, uidSet)
+	end
+end
+
+local function sendRace(library, command, remotes, setA, setB)
+	local remote = remotes[command.name]
+	bucket.hits = 0
+	bucket.foreign = 0
+	bucket.expect = nil
+	bucket.expectAny = true
+	bucket.remote = remote
+	bucket.capture = nil
+	bucket.loose = remote == nil
+	bucket.method = nil
+	bucket.armed = true
+	local errA, errB = nil, nil
+	task.spawn(function()
+		local ok, err = pcall(invokeOne, library, command, remotes[command.name], setA)
+		if not ok then
+			errA = err
+		end
+	end)
+	task.wait(RACE_GAP)
+	task.spawn(function()
+		local ok, err = pcall(invokeOne, library, command, remotes[command.name], setB)
+		if not ok then
+			errB = err
+		end
+	end)
+	local deadline = os.clock() + 1.5
+	while running and bucket.hits < 1 and os.clock() < deadline do
+		task.wait(0.05)
+	end
+	-- Give the second invoke a moment to land.
+	task.wait(0.15)
+	if bucket.loose and typeof(bucket.capture) == "Instance" then
+		remotes[command.name] = bucket.capture
+		log(string.format("[REMOTE] %s visto id %s (%s)", command.name, debugId(bucket.capture), bucket.capture.ClassName))
+	end
+	local hits = bucket.hits
+	local method = bucket.method
+	bucket.armed = false
+	bucket.loose = false
+	bucket.expectAny = false
+	bucket.remote = nil
+	bucket.capture = nil
+	if errA then
+		log("[NET] race A fallita: " .. tostring(errA))
+	end
+	if errB then
+		log("[NET] race B fallita: " .. tostring(errB))
+	end
+	return hits, method
 end
 
 local function run()
@@ -821,13 +869,16 @@ local function run()
 		setStatus("Save assente", Color3.fromRGB(255, 160, 120))
 		return
 	end
-	local uid, petId = pickOwnedUid(library)
-	if uid then
-		log(string.format("[SAVE] UID di prova: %s | petId %s", uid, tostring(petId)))
-	else
-		log("[SAVE] Nessun UID pet in inventario. I passi valid_1_uid saranno saltati.")
+	local uids = collectUids(library)
+	local setA, setB, setMode = makeUidSets(uids)
+	log(string.format("[SAVE] pet UID trovati: %d | set mode: %s", #uids, tostring(setMode)))
+	if not setA or not setB then
+		log("[INFO] Servono pet in inventario per la race. Test annullato")
+		setStatus("UID assenti", Color3.fromRGB(255, 160, 120))
+		return
 	end
-	log("[CLOCK] Baseline 4s su LastSaveTimestamp + SaveVersion (FreeGiftsTime ignorato per il verdetto)")
+	log(string.format("[SAVE] setA=%s | setB=%s", table.concat(setA, ","), table.concat(setB, ",")))
+	log("[CLOCK] Baseline 4s su LastSaveTimestamp + SaveVersion")
 	local baseline, why = observeDualBaseline(library)
 	if not running or why == "stop" then
 		return
@@ -850,16 +901,13 @@ local function run()
 		baseline.ticksB
 	))
 	if baseline.ticksA < 1 and baseline.ticksB < 1 then
-		log("[INFO] Entrambi i clock erano gia fermi prima dei payload. Verdetto non emesso")
+		log("[INFO] Entrambi i clock erano gia fermi prima della race. Verdetto non emesso")
 		setStatus("Polso gia fermo", Color3.fromRGB(255, 200, 120))
 		return
 	end
-	if baseline.ticksA < 1 or baseline.ticksB < 1 then
-		log("[CLOCK] Nota: un campo del polso duale non si e mosso in baseline. Serve che entrambi restino fermi dopo il payload.")
-	end
 	setStatus("Cerco i remote")
 	local remotes, blocked = scanNetwork(library, true)
-	log("[REMOTE] Invio automatico via Network. Nessuna azione in gioco richiesta.")
+	log("[REMOTE] Race automatica via Network. Nessuna azione in gioco.")
 	if not running then
 		return
 	end
@@ -867,7 +915,7 @@ local function run()
 		setStatus("Hook assente", Color3.fromRGB(255, 160, 120))
 		return
 	end
-	for _, command in ipairs(COMMANDS) do
+	for _, command in ipairs(RACE_COMMANDS) do
 		if not running then
 			return
 		end
@@ -875,76 +923,67 @@ local function run()
 			log("[REMOTE] " .. command.name .. " ambiguo, salto")
 			continue
 		end
-		log("[TEST] Comando: " .. command.name)
-		for _, step in ipairs(PAYLOAD_STEPS) do
-			if not running then
-				return
-			end
-			local args, skip = buildPayload(command.shape, step, uid, petId)
-			if skip == "skip_valid_delete" then
-				log("[TEST] Delete Several Pets | valid_1_uid saltato (evito cancellazione reale)")
-				continue
-			end
-			if skip == "no_uid" then
-				log("[TEST] " .. command.name .. " | " .. step .. " saltato (nessun UID)")
-				continue
-			end
-			if type(args) ~= "table" then
-				log("[TEST] " .. command.name .. " | " .. step .. " non costruibile")
-				continue
-			end
-			setStatus(command.name .. " " .. step)
-			local remote = remotes[command.name]
-			local hits = 0
-			local foreign = 0
-			local callOk = true
-			local callErr = nil
-			local method = nil
-			if remote then
-				hits, foreign, callOk, callErr, method = sendArgs(remote, args)
-			else
-				local capture
-				hits, capture, callOk, callErr, method = sendLoose(library, command, args)
-				foreign = 0
-				if hits > 0 and typeof(capture) == "Instance" then
-					remotes[command.name] = capture
-					log(string.format("[REMOTE] %s visto id %s (%s)", command.name, debugId(capture), capture.ClassName))
-				end
-			end
-			if not callOk then
-				log("[NET] invio fallito: " .. tostring(callErr))
-			end
-			if hits >= 1 and foreign == 0 then
-				log(string.format("[NET] %s | %s | confermato via %s", command.name, step, method or "Network"))
-			else
-				local detail = (hits == 0 and foreign == 0) and "nessun invio" or "non isolato"
-				log(string.format("[NET] %s | %s | %s", command.name, step, detail))
-			end
-			if not running then
-				return
-			end
-			if hits < 1 then
-				log("[SYNC] Nessun pacchetto uscito, salto hold per questo payload")
-				continue
-			end
-			log(string.format("[SYNC] Hold duale dopo %s | %s", command.name, step))
-			local frozen = holdDual(library)
-			if not running then
-				return
-			end
-			if frozen then
-				log(string.format(
-					"[SAVE FROZEN] Trovato il comando che blocca il salvataggio: %s con payload %s",
-					command.name,
-					step
-				))
-				setStatus("SAVE FROZEN", Color3.fromRGB(255, 90, 90))
-				setStroke(Color3.fromRGB(210, 50, 50))
-				return
-			end
+		log(string.format("[TEST] Race su %s | gap %.2fs | due Invoke quasi insieme", command.name, RACE_GAP))
+		setStatus("Race " .. command.name)
+		local hits, method = sendRace(library, command, remotes, setA, setB)
+		if not running then
+			return
+		end
+		if hits < 1 then
+			log(string.format("[NET] %s | race | nessun invio", command.name))
+			log("[SYNC] Skip hold: pacchetto non uscito")
+			continue
+		end
+		log(string.format("[NET] %s | race | hits=%d via %s", command.name, hits, method or "Network"))
+		log("[SYNC] Hold duale dopo race " .. command.name)
+		local frozen = holdDual(library)
+		if not running then
+			return
+		end
+		if frozen then
+			log(string.format("[SAVE FROZEN] Race condition rilevata su %s", command.name))
+			setStatus("SAVE FROZEN", Color3.fromRGB(255, 90, 90))
+			setStroke(Color3.fromRGB(210, 50, 50))
+			return
 		end
 	end
-	log("[SYNC] Nessun payload ha fermato LastSaveTimestamp e SaveVersion per 3 cicli.")
+	log("[TEST] Race negative. Ultimo tentativo: Pet Positions con Vector3 NaN/inf")
+	setStatus("Pet Positions NaN")
+	local posMap = nanInfMap(uids)
+	local posArgs = { posMap }
+	local posRemote = remotes[POSITIONS_COMMAND.name]
+	local hits = 0
+	local foreign = 0
+	local callOk = true
+	local callErr = nil
+	local method = nil
+	if posRemote and not blocked[POSITIONS_COMMAND.name] then
+		hits, foreign, callOk, callErr, method = sendArgs(posRemote, posArgs)
+	else
+		local capture
+		hits, capture, callOk, callErr, method = sendLoose(library, POSITIONS_COMMAND, posArgs)
+		foreign = 0
+		if hits > 0 and typeof(capture) == "Instance" then
+			log(string.format("[REMOTE] Pet Positions visto id %s (%s)", debugId(capture), capture.ClassName))
+		end
+	end
+	if not callOk then
+		log("[NET] Pet Positions fallito: " .. tostring(callErr))
+	end
+	if hits >= 1 and foreign == 0 then
+		log(string.format("[NET] Pet Positions | NaN/inf map | confermato via %s", method or "Network"))
+		log("[SYNC] Hold duale dopo Pet Positions")
+		local frozen = holdDual(library)
+		if frozen then
+			log("[SAVE FROZEN] Race condition rilevata su Pet Positions")
+			setStatus("SAVE FROZEN", Color3.fromRGB(255, 90, 90))
+			setStroke(Color3.fromRGB(210, 50, 50))
+			return
+		end
+	else
+		log("[NET] Pet Positions | NaN/inf map | nessun invio")
+	end
+	log("[SYNC] Nessuna race ha fermato LastSaveTimestamp e SaveVersion per 3 cicli.")
 	setStatus("Save vivo", Color3.fromRGB(120, 220, 140))
 	setStroke(Color3.fromRGB(40, 150, 80))
 end
@@ -990,6 +1029,8 @@ local function setRunning(state)
 	end
 end
 
+local UserInputService = game:GetService("UserInputService")
+
 local parentGui = LocalPlayer:WaitForChild("PlayerGui")
 if type(gethui) == "function" then
 	local ok, guiRoot = pcall(gethui)
@@ -1028,15 +1069,16 @@ frameStroke.Thickness = 1.5
 frameStroke.Color = Color3.fromRGB(70, 110, 170)
 frameStroke.Parent = frame
 
-local title = Instance.new("TextLabel")
+local title = Instance.new("TextButton")
 title.BackgroundTransparency = 1
-title.Position = UDim2.fromOffset(8, 4)
-title.Size = UDim2.new(1, -16, 0, 16)
+title.Position = UDim2.fromOffset(8, 2)
+title.Size = UDim2.new(1, -16, 0, 20)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 12
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = Color3.fromRGB(236, 240, 248)
-title.Text = "SAVE FREEZE"
+title.Text = "SAVE FREEZE  (trascina)"
+title.AutoButtonColor = false
 title.Parent = frame
 
 startBtn = Instance.new("TextButton")
@@ -1081,11 +1123,30 @@ statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
 statusLabel.Parent = frame
 
+logScroll = Instance.new("ScrollingFrame")
+logScroll.Name = "LogScroll"
+logScroll.Position = UDim2.fromOffset(8, 56)
+logScroll.Size = UDim2.new(1, -16, 1, -64)
+logScroll.BackgroundColor3 = Color3.fromRGB(7, 9, 14)
+logScroll.BorderSizePixel = 0
+logScroll.ScrollBarThickness = 8
+logScroll.ScrollBarImageColor3 = Color3.fromRGB(120, 140, 170)
+logScroll.ScrollingDirection = Enum.ScrollingDirection.Y
+logScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+logScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+logScroll.Active = true
+logScroll.Parent = frame
+
+local scrollCorner = Instance.new("UICorner")
+scrollCorner.CornerRadius = UDim.new(0, 6)
+scrollCorner.Parent = logScroll
+
 logBox = Instance.new("TextBox")
 logBox.Name = "LogText"
-logBox.Position = UDim2.fromOffset(8, 56)
-logBox.Size = UDim2.new(1, -16, 1, -64)
-logBox.BackgroundColor3 = Color3.fromRGB(7, 9, 14)
+logBox.Position = UDim2.fromOffset(4, 0)
+logBox.Size = UDim2.new(1, -14, 0, 0)
+logBox.AutomaticSize = Enum.AutomaticSize.Y
+logBox.BackgroundTransparency = 1
 logBox.TextColor3 = Color3.fromRGB(226, 232, 240)
 logBox.Font = Enum.Font.Code
 logBox.TextSize = 11
@@ -1098,18 +1159,46 @@ logBox.MultiLine = true
 logBox.Active = true
 logBox.Selectable = true
 logBox.Text = ""
-logBox.Parent = frame
+logBox.Parent = logScroll
 
-local logCorner = Instance.new("UICorner")
-logCorner.CornerRadius = UDim.new(0, 6)
-logCorner.Parent = logBox
+local dragging = false
+local dragStart = nil
+local startPos = nil
+
+title.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = frame.Position
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if not dragging then
+		return
+	end
+	if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+		local delta = input.Position - dragStart
+		frame.Position = UDim2.new(
+			startPos.X.Scale,
+			startPos.X.Offset + delta.X,
+			startPos.Y.Scale,
+			startPos.Y.Offset + delta.Y
+		)
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = false
+	end
+end)
 
 startBtn.MouseButton1Click:Connect(function()
 	setRunning(not running)
 end)
 copyBtn.MouseButton1Click:Connect(copyLogs)
 logBox.Focused:Connect(function()
-	-- Keep current log selectable; do not clear.
 	pcall(function()
 		logBox.Text = table.concat(lines, "\n")
 		logBox.CursorPosition = #logBox.Text + 1
@@ -1120,7 +1209,8 @@ logBox.FocusLost:Connect(function()
 	pcall(function()
 		logBox.Text = table.concat(lines, "\n")
 	end)
+	scrollLogsToBottom()
 end)
 
-log("[GUI] Solo START. Nessuna azione in gioco. Tocca il log per selezionare/copiare.")
-log("[GUI] Polso: LastSaveTimestamp + SaveVersion.")
+log("[GUI] Solo START. Race pet + Pet Positions NaN. Trascina dal titolo.")
+log("[GUI] Scroll a destra sui log. Polso: LastSaveTimestamp + SaveVersion.")
