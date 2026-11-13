@@ -24,9 +24,9 @@ local COMMANDS = {
 
 local PAYLOAD_STEPS = { "valid_1_uid", "{0}", "{}", "{nil}", "string" }
 local CHECKS = 3
-local WATCH_SECONDS = 6
+local WATCH_SECONDS = 4
 local SAMPLE_STEP = 1
-local HOLD_STEP = 4
+local HOLD_STEP = 2.5
 local MAX_LINES = 600
 
 local root = _G
@@ -408,6 +408,9 @@ local function holdDual(library)
 	end
 	local holdCount = 0
 	for index = 1, CHECKS do
+		if not running then
+			return false
+		end
 		setStatus(string.format("Hold %d/%d", index, CHECKS))
 		if not waitSeconds(HOLD_STEP) then
 			return false
@@ -425,20 +428,20 @@ local function holdDual(library)
 				tostring(nowB),
 				holdCount
 			))
+			if holdCount >= 3 then
+				return true
+			end
 		else
-			holdCount = 0
 			log(string.format(
-				"[SYNC] Check %d: avanza | LastSaveTimestamp %s -> %s | SaveVersion %s -> %s",
+				"[SYNC] Check %d: avanza | LastSaveTimestamp %s -> %s | SaveVersion %s -> %s | vivo, next payload",
 				index,
 				tostring(prevA),
 				tostring(nowA),
 				tostring(prevB),
 				tostring(nowB)
 			))
-			prevA, prevB = nowA, nowB
-		end
-		if holdCount >= 3 then
-			return true
+			-- Save still writing: no need to wait the remaining checks.
+			return false
 		end
 	end
 	return false
@@ -824,7 +827,7 @@ local function run()
 	else
 		log("[SAVE] Nessun UID pet in inventario. I passi valid_1_uid saranno saltati.")
 	end
-	log("[CLOCK] Baseline 6s su LastSaveTimestamp + SaveVersion (FreeGiftsTime ignorato per il verdetto)")
+	log("[CLOCK] Baseline 4s su LastSaveTimestamp + SaveVersion (FreeGiftsTime ignorato per il verdetto)")
 	local baseline, why = observeDualBaseline(library)
 	if not running or why == "stop" then
 		return
@@ -917,12 +920,18 @@ local function run()
 				local detail = (hits == 0 and foreign == 0) and "nessun invio" or "non isolato"
 				log(string.format("[NET] %s | %s | %s", command.name, step, detail))
 			end
+			if not running then
+				return
+			end
 			if hits < 1 then
 				log("[SYNC] Nessun pacchetto uscito, salto hold per questo payload")
 				continue
 			end
 			log(string.format("[SYNC] Hold duale dopo %s | %s", command.name, step))
 			local frozen = holdDual(library)
+			if not running then
+				return
+			end
 			if frozen then
 				log(string.format(
 					"[SAVE FROZEN] Trovato il comando che blocca il salvataggio: %s con payload %s",
@@ -931,9 +940,6 @@ local function run()
 				))
 				setStatus("SAVE FROZEN", Color3.fromRGB(255, 90, 90))
 				setStroke(Color3.fromRGB(210, 50, 50))
-				return
-			end
-			if not waitSeconds(0.2) then
 				return
 			end
 		end
