@@ -4,13 +4,12 @@
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
--- override.x/y bypassano packInput: sono Q16. x=1 e' ~0 moto.
--- jump=true basta per il test "sale"; MOVE_* da un po' di input diagonale leggibile.
-local USE_Q16_MOVE = true
-local MOVE_X = USE_Q16_MOVE and 46341 or 1
-local MOVE_Y = USE_Q16_MOVE and 46341 or 1
-local LOOP_DT = 0.1
-local LOG_POS_EVERY = 1.0
+-- override.x/y = Q16 packati (bypass packInput). x=46341 + y=46341 = diagonale piena → void.
+-- Default sicuro: fermo (0,0) + salto a impulso solo se grounded (evita dash aereo spam).
+local LOOP_DT = 0.05
+local LOG_POS_EVERY = 0.5
+local JUMP_COOLDOWN = 0.55 -- secondi tra un edge di salto e il successivo
+local mode = "jump" -- "jump" = fermo+salto | "move" = diagonale pericolosa (test moto)
 
 local env = _G
 pcall(function()
@@ -64,8 +63,8 @@ gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.Parent = host
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(460, 500)
-frame.Position = UDim2.new(0.5, -230, 0.5, -250)
+frame.Size = UDim2.fromOffset(460, 540)
+frame.Position = UDim2.new(0.5, -230, 0.5, -270)
 frame.BackgroundColor3 = Color3.fromRGB(16, 18, 24)
 frame.BackgroundTransparency = 0.05
 frame.BorderSizePixel = 0
@@ -95,10 +94,10 @@ title.TextColor3 = Color3.fromRGB(235, 240, 248)
 title.Text = "Prime Dash Delta Control"
 title.Parent = frame
 
-local function makeBtn(text, xScale, xOffset, color)
+local function makeBtn(text, xScale, xOffset, y, color)
 	local btn = Instance.new("TextButton")
 	btn.Size = UDim2.new(xScale, -16, 0, 34)
-	btn.Position = UDim2.new(xOffset, xOffset == 0 and 12 or 4, 0, 40)
+	btn.Position = UDim2.new(xOffset, xOffset == 0 and 12 or 4, 0, y)
 	btn.BackgroundColor3 = color
 	btn.BorderSizePixel = 0
 	btn.AutoButtonColor = true
@@ -113,13 +112,14 @@ local function makeBtn(text, xScale, xOffset, color)
 	return btn
 end
 
-local startBtn = makeBtn("START", 1 / 3, 0, Color3.fromRGB(42, 118, 78))
-local stopBtn = makeBtn("STOP", 1 / 3, 1 / 3, Color3.fromRGB(140, 60, 60))
-local copyBtn = makeBtn("COPIA LOG", 1 / 3, 2 / 3, Color3.fromRGB(45, 95, 170))
+local startBtn = makeBtn("START", 1 / 3, 0, 40, Color3.fromRGB(42, 118, 78))
+local stopBtn = makeBtn("STOP", 1 / 3, 1 / 3, 40, Color3.fromRGB(140, 60, 60))
+local copyBtn = makeBtn("COPIA LOG", 1 / 3, 2 / 3, 40, Color3.fromRGB(45, 95, 170))
+local modeBtn = makeBtn("MODE: JUMP (safe)", 1, 0, 80, Color3.fromRGB(42, 48, 64))
 
 local logFrame = Instance.new("ScrollingFrame")
-logFrame.Position = UDim2.fromOffset(12, 84)
-logFrame.Size = UDim2.new(1, -24, 1, -96)
+logFrame.Position = UDim2.fromOffset(12, 124)
+logFrame.Size = UDim2.new(1, -24, 1, -136)
 logFrame.BackgroundColor3 = Color3.fromRGB(10, 12, 16)
 logFrame.BackgroundTransparency = 0.2
 logFrame.BorderSizePixel = 0
@@ -485,11 +485,44 @@ local function stopTest(reason)
 	startBtn.BackgroundColor3 = Color3.fromRGB(42, 118, 78)
 end
 
-local function applyOverride(ctrl)
+local function paintMode()
+	if mode == "jump" then
+		modeBtn.Text = "MODE: JUMP (safe)"
+		modeBtn.BackgroundColor3 = Color3.fromRGB(42, 118, 78)
+	else
+		modeBtn.Text = "MODE: MOVE+JUMP (void!)"
+		modeBtn.BackgroundColor3 = Color3.fromRGB(140, 80, 40)
+	end
+end
+
+local function moveAxes()
+	if mode == "move" then
+		return 46341, 46341 -- diagonale Q16: ti butta via dalla piattaforma
+	end
+	return 0, 0
+end
+
+local function isGrounded(actor)
+	local ok, grounded = pcall(function()
+		local s = actor and actor.s
+		if typeof(s) ~= "table" then
+			return false
+		end
+		if s.Grounded == true then
+			return true
+		end
+		local old = s.OldGrounded
+		return typeof(old) == "number" and old > 0
+	end)
+	return ok and grounded == true
+end
+
+local function applyOverride(ctrl, wantJump)
+	local mx, my = moveAxes()
 	ctrl.override = {
-		x = MOVE_X,
-		y = MOVE_Y,
-		jump = true,
+		x = mx,
+		y = my,
+		jump = wantJump == true,
 		punch = false,
 	}
 end
@@ -513,27 +546,18 @@ local function startTest()
 	startBtn.Text = "RUNNING"
 	startBtn.BackgroundColor3 = Color3.fromRGB(90, 90, 50)
 
+	local mx, my = moveAxes()
 	log(string.format(
-		"[TEST] Override loop source=%s x=%d y=%d jump=true",
+		"[TEST] source=%s mode=%s x=%d y=%d jump=edge@%.2fs se grounded",
 		tostring(source),
-		MOVE_X,
-		MOVE_Y
+		mode,
+		mx,
+		my,
+		JUMP_COOLDOWN
 	), C_ACT)
-	if USE_Q16_MOVE then
-		log("[TEST] MOVE in Q16 (x=1 sarebbe ~0). jump riscritto ogni 0.1s", C_INFO)
-	end
+	log("[TEST] Override sostituisce WASD: con MOVE corri nel void (FallY).", C_WARN)
+	log("[TEST] JUMP spam ogni 0.1s = salto+dash aereo. Ora solo impulsi a terra.", C_INFO)
 
-	-- prova anche a scrivere sul nome classico se presente
-	pcall(function()
-		if typeof(_G) == "table" then
-			_G.__SG056Control = ctrl
-		end
-	end)
-	pcall(function()
-		if typeof(getgenv) == "function" then
-			getgenv().__SG056Control = ctrl
-		end
-	end)
 	pcall(function()
 		if typeof(getrenv) == "function" then
 			local r = getrenv()
@@ -546,22 +570,47 @@ local function startTest()
 	task.spawn(function()
 		local ticks = 0
 		local lastPosLog = 0
+		local lastJumpAt = -math.huge
 		local y0 = nil
+		local jumpCount = 0
 
 		while running and token == loopToken do
 			local okLoop, loopErr = pcall(function()
 				if typeof(controlRef) ~= "table" then
 					error("controlRef perso")
 				end
-				applyOverride(controlRef)
-				ticks += 1
-				if ticks == 1 or ticks % 10 == 0 then
-					log(string.format("[TEST] Override impostato (#%d)", ticks), C_ACT)
-				end
 
 				local actor = controlRef.actor
-				local y = readActorY(actor)
+				if actor and actor.eliminated == true then
+					log("[TEST] eliminated=true → stop automatico (void/laser)", C_ERR)
+					stopTest("eliminated")
+					return
+				end
+
 				local now = os.clock()
+				local grounded = isGrounded(actor)
+				local wantJump = false
+				if grounded and (now - lastJumpAt) >= JUMP_COOLDOWN then
+					wantJump = true
+					lastJumpAt = now
+					jumpCount += 1
+					log(string.format("[JUMP] edge #%d (grounded)", jumpCount), C_ACT)
+				end
+
+				applyOverride(controlRef, wantJump)
+				ticks += 1
+				if ticks == 1 or ticks % 40 == 0 then
+					local ax, ay = moveAxes()
+					log(string.format(
+						"[TEST] hold override (#%d) x=%d y=%d grounded=%s",
+						ticks,
+						ax,
+						ay,
+						tostring(grounded)
+					), C_INFO)
+				end
+
+				local y = readActorY(actor)
 				if y ~= nil then
 					if y0 == nil then
 						y0 = y
@@ -569,14 +618,15 @@ local function startTest()
 					if now - lastPosLog >= LOG_POS_EVERY then
 						lastPosLog = now
 						log(string.format(
-							"[ACTOR] y=%d (%.3f u) dy=%d eliminated=%s",
+							"[ACTOR] y=%d (%.3f u) dy=%d grounded=%s elim=%s",
 							y,
 							y / 65536,
 							y - y0,
+							tostring(grounded),
 							tostring(actor and actor.eliminated)
 						), C_OK)
 					end
-				elseif ticks == 1 or ticks % 20 == 0 then
+				elseif ticks == 1 or ticks % 40 == 0 then
 					log("[ACTOR] nil o senza position.y", C_WARN)
 				end
 			end)
@@ -584,6 +634,9 @@ local function startTest()
 			if not okLoop then
 				log("[ERR] " .. tostring(loopErr), C_ERR)
 				stopTest("errore loop")
+				return
+			end
+			if not running or token ~= loopToken then
 				return
 			end
 			task.wait(LOOP_DT)
@@ -613,6 +666,18 @@ local function copyLog()
 	end)
 end
 
+paintMode()
+
+modeBtn.MouseButton1Click:Connect(function()
+	if running then
+		log("[MODE] Ferma il test prima di cambiare mode", C_WARN)
+		return
+	end
+	mode = mode == "jump" and "move" or "jump"
+	paintMode()
+	log("[MODE] " .. mode, C_ACT)
+end)
+
 startBtn.MouseButton1Click:Connect(function()
 	pcall(startTest)
 end)
@@ -639,5 +704,6 @@ env.__PrimeDashDeltaCtrl = {
 	end,
 }
 
-log("Delta control ready. START = dump + discover + override loop.", C_OK)
-log("Cerca in _G / getgenv / getrenv._G / getsenv / getgc.", C_INFO)
+log("Delta control ready. Default MODE=JUMP (x=0,y=0, salto grounded).", C_OK)
+log("Il log precedente: move diagonale + jump spam → dash → void → FallY.", C_WARN)
+log("Cerca in getrenv._G.__SG056Control (confermato dai tuoi log).", C_INFO)
